@@ -311,9 +311,11 @@ nonisolated final class SFTPWorker: @unchecked Sendable {
         case SSH_KNOWN_HOSTS_CHANGED:
             throw SFTPError(message: "HOST KEY CHANGED — possible man-in-the-middle. If the device was reinstalled, remove its entry from ~/.ssh/known_hosts and reconnect.")
         case SSH_KNOWN_HOSTS_OTHER:
-            let saved = ssh_session_update_known_hosts(session) == 0
-            return saved ? "host key type changed for this server; new key saved"
-                : "host key could NOT be saved to known_hosts: \(Self.errorString(session))"
+            // A different key TYPE than the pinned one — libssh calls this a
+            // possible attack. Auto-saving it let a MITM bypass the CHANGED
+            // check just by offering RSA instead of ed25519. Refuse, like
+            // SheepTerm does.
+            throw SFTPError(message: "HOST KEY TYPE CHANGED — the server offered a different key type than the one pinned in ~/.ssh/known_hosts (possible man-in-the-middle). If the device was reconfigured, remove its entry and reconnect.")
         default: // NOT_FOUND / UNKNOWN — first connection
             let saved = ssh_session_update_known_hosts(session) == 0
             return saved ? "first connection — host key saved to known_hosts"

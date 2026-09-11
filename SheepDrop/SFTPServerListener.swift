@@ -275,19 +275,22 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
         guard let (channel, request) = openChannel(session) else {
             return
         }
-        defer { ssh_channel_free(channel) }
-
         switch request {
         case .sftp:
-            guard let sftp = sftp_server_new(session, channel), sftp_server_init(sftp) == SSH_OK else {
-                return
+            guard let sftp = sftp_server_new(session, channel) else {
+                ssh_channel_free(channel); return
             }
+            // sftp_free() frees the channel itself (verified in libssh 0.12) —
+            // a second ssh_channel_free here was a double free / use-after-free
+            // after every SFTP session.
             defer { sftp_free(sftp) }
+            guard sftp_server_init(sftp) == SSH_OK else { return }
             let handler = SFTPRequestHandler(sftp: sftp, root: URL(fileURLWithPath: config.rootPath),
                                              allowWrites: allowWrites, peer: peer, onLog: onLog,
                                              onProgress: onProgress)
             handler.loop()
         case .scp(let command):
+            defer { ssh_channel_free(channel) }
             // Same SSH server also answers `copy scp://user@mac:port/…`.
             SCPServerHandler(channel: channel, command: command,
                              root: URL(fileURLWithPath: config.rootPath),

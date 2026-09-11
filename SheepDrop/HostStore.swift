@@ -17,12 +17,24 @@ final class HostStore {
     static let maxRecents = 20
 
     func loadGroups() -> [HostGroup] {
-        guard let data = try? Data(contentsOf: hostsURL),
-              let groups = try? JSONDecoder().decode([HostGroup].self, from: data)
-        else {
+        guard let data = try? Data(contentsOf: hostsURL) else {
+            return [HostGroup(name: "My Devices")]
+        }
+        guard let groups = try? JSONDecoder().decode([HostGroup].self, from: data) else {
+            // Undecodable (corrupt, or written by a newer build). The first save
+            // would overwrite it and the second would rotate the .bak away too —
+            // losing every saved host. Move it aside so it can be recovered.
+            quarantine(hostsURL)
             return [HostGroup(name: "My Devices")]
         }
         return groups
+    }
+
+    private func quarantine(_ url: URL) {
+        let stamp = Int(Date().timeIntervalSince1970)
+        let aside = url.deletingLastPathComponent()
+            .appendingPathComponent("\(url.lastPathComponent).unreadable-\(stamp)")
+        try? FileManager.default.moveItem(at: url, to: aside)
     }
 
     func loadRecents() -> [HostEntry] {

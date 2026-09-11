@@ -256,6 +256,10 @@ nonisolated final class TFTPServer: @unchecked Sendable {
 
         private func handle(packet: Data, first: Bool) {
             let opcode = UInt16(packet[packet.startIndex]) << 8 | UInt16(packet[packet.startIndex + 1])
+            // A new peer's first datagram must be a request. A stray ACK/DATA
+            // (late retransmit from a finished transfer's port) used to open a
+            // session that waited forever with no timer armed.
+            if first && opcode != 1 && opcode != 2 { finish(nil); return }
             switch opcode {
             case 1, 2: // RRQ / WRQ
                 guard first else { receiveNext(); return }
@@ -363,6 +367,9 @@ nonisolated final class TFTPServer: @unchecked Sendable {
                 }
                 lastPacket = oack
                 send(oack)
+                // Arm the timer: a lost OACK (or a peer that never answers)
+                // used to leave the session + its open file handle forever.
+                scheduleRetransmit()
                 // read: wait for ACK 0 → then DATA 1. write: peer sends DATA 1.
             } else if isWrite {
                 sendAck(0)
@@ -380,8 +387,14 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             // buggy client used to crash on the block-number subscript.
             guard packet.count >= 4 else { receiveNext(); return }
             let block = UInt16(packet[packet.startIndex + 2]) << 8 | UInt16(packet[packet.startIndex + 3])
+            // Only the ACK for the block in flight advances. Answering every
+            // ACK re-sent the next block on each duplicate (Sorcerer's
+            // Apprentice), and a stale ACK just past the 65535 wrap moved
+            // lastRawBlock backwards → a phantom second wrap → wrong offsets.
+            // Lost packets are resent by the retransmit timer instead.
+            guard block == currentBlock else { receiveNext(); return }
             retries = 0
-            if sentFinal && block == currentBlock {
+            if sentFinal {
                 reportDone(done: fileSize, isUpload: false)
                 finish("sent \(ByteFormat.string(Int64(fileSize)))")
                 return

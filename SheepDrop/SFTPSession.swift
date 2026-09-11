@@ -340,6 +340,13 @@ final class SFTPSession: ObservableObject {
     func download(entryName: String, into localDirectory: URL,
                   completion: @escaping @MainActor () -> Void) {
         let remotePath = joined(path, entryName)
+        // The name comes from the SERVER's listing — a hostile one could list
+        // "../../Library/LaunchAgents/x.plist" and land a file outside the
+        // chosen folder.
+        guard Self.isSafeLocalName(entryName) else {
+            notice = "Download refused: unsafe file name “\(entryName)”"
+            return
+        }
         let localURL = localDirectory.appendingPathComponent(entryName)
         transfer = TransferState(name: entryName, isUpload: false, done: 0, total: 0)
         Task {
@@ -352,10 +359,12 @@ final class SFTPSession: ObservableObject {
                             name: entryName, isUpload: false, done: done, total: total)
                     }
                 }
-                if isFTP {
-                    try await ftp.download(remotePath: remotePath, to: localURL, progress: progress)
-                } else {
-                    try await worker.download(remotePath: remotePath, to: localURL, progress: progress)
+                try await Self.downloadAtomically(to: localURL) { partURL in
+                    if self.isFTP {
+                        try await self.ftp.download(remotePath: remotePath, to: partURL, progress: progress)
+                    } else {
+                        try await self.worker.download(remotePath: remotePath, to: partURL, progress: progress)
+                    }
                 }
                 let got = throttle.finalDone
                 transfer = nil
@@ -372,6 +381,35 @@ final class SFTPSession: ObservableObject {
                     isUpload: false, bytes: 0, failed: true)
                 report(error, prefix: "Download failed: ")
             }
+        }
+    }
+
+    /// A listing name that is safe to use as a single local path component.
+    static func isSafeLocalName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".."
+            && !name.contains("/") && !name.contains("\0")
+    }
+
+    /// Runs `body` against a hidden `.part` sibling of `localURL` and promotes
+    /// it over `localURL` only on success. The workers truncate their target
+    /// up front, so writing straight to `localURL` zeroed an existing good
+    /// file when the server then refused (550), and a mid-transfer failure left
+    /// a truncated firmware image under its real name.
+    private static func downloadAtomically(to localURL: URL,
+                                           _ body: (URL) async throws -> Void) async throws {
+        let fm = FileManager.default
+        let partURL = localURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(localURL.lastPathComponent).sheepdrop-part")
+        do {
+            try await body(partURL)
+            if fm.fileExists(atPath: localURL.path) {
+                _ = try fm.replaceItemAt(localURL, withItemAt: partURL)
+            } else {
+                try fm.moveItem(at: partURL, to: localURL)
+            }
+        } catch {
+            try? fm.removeItem(at: partURL)
+            throw error
         }
     }
 
@@ -407,10 +445,12 @@ final class SFTPSession: ObservableObject {
         Task {
             do {
                 let throttle = ProgressThrottle()
-                try await worker.scpDownload(remotePath: remotePath, to: localURL) { [weak self] done, total in
-                    guard throttle.note(done, total) else { return }
-                    Task { @MainActor in
-                        self?.transfer = TransferState(name: name, isUpload: false, done: done, total: total)
+                try await Self.downloadAtomically(to: localURL) { partURL in
+                    try await self.worker.scpDownload(remotePath: remotePath, to: partURL) { [weak self] done, total in
+                        guard throttle.note(done, total) else { return }
+                        Task { @MainActor in
+                            self?.transfer = TransferState(name: name, isUpload: false, done: done, total: total)
+                        }
                     }
                 }
                 transfer = nil
@@ -449,9 +489,16 @@ final class SFTPSession: ObservableObject {
             // "451 … timeout") means that transfer failed, not the control
             // connection — tearing the session down would force a needless
             // re-login. Only 421 (service closing) is a real control-conn loss.
+            // Match the reply CODE, not any "421" in the text — "FTP 550
+            // /fw/AOS_7421.swi: No such file" used to drop the session.
             if message.hasPrefix("ftp ") {
-                return message.contains("421") || message.contains("not connected")
+                return message.hasPrefix("ftp 421")
             }
+            // Messages embed the remote path before the first ": " ("cannot
+            // open /logs/disconnect.log: Permission denied"); only the part
+            // after it is the transport's error text, so a file name like
+            // "timeout.cfg" can't masquerade as a dead connection.
+            let reason = message.range(of: ": ").map { String(message[$0.upperBound...]) } ?? message
             // SSH/SFTP transport death — libssh reports "Socket error:
             // Connection reset by peer" / "Timeout" etc. (wrapped by doList as
             // "cannot open <path>: <that>"). Match the real transport tokens, not
@@ -462,7 +509,7 @@ final class SFTPSession: ObservableObject {
                         "broken pipe", "timed out", "timeout", "no route to host",
                         "network is down", "network is unreachable",
                         "connection refused", "end of file", "channel is closed"]
-            return dead.contains { message.contains($0) }
+            return dead.contains { reason.contains($0) }
         }
         return false
     }

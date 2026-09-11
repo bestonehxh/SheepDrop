@@ -39,6 +39,32 @@ struct HostGroup: Identifiable, Codable, Hashable, Sendable {
     var hosts: [HostEntry] = []
 }
 
+// Tolerant decoding: synthesized Codable ignores property defaults, so adding a
+// field in a later build made every existing hosts.json throw keyNotFound.
+// Missing keys fall back to the defaults above.
+extension HostEntry {
+    private enum CodingKeys: String, CodingKey { case id, name, address, port, username, proto }
+    nonisolated init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        address = try c.decodeIfPresent(String.self, forKey: .address) ?? ""
+        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 22
+        username = try c.decodeIfPresent(String.self, forKey: .username) ?? ""
+        proto = try c.decodeIfPresent(TransferProtocolKind.self, forKey: .proto) ?? .sftp
+    }
+}
+
+extension HostGroup {
+    private enum CodingKeys: String, CodingKey { case id, name, hosts }
+    nonisolated init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Group"
+        hosts = try c.decodeIfPresent([HostEntry].self, forKey: .hosts) ?? []
+    }
+}
+
 struct TransferRecord: Identifiable, Sendable {
     let id = UUID()
     var name: String

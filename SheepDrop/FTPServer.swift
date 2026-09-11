@@ -120,6 +120,10 @@ nonisolated final class FTPServer: @unchecked Sendable {
         return candidate.path == base || candidate.path.hasPrefix(basePrefix) ? candidate : nil
     }
 
+    fileprivate func isRoot(_ url: URL) -> Bool {
+        url.standardizedFileURL.path == rootURL.standardizedFileURL.path
+    }
+
     // MARK: - One control session
 
     fileprivate final class Session: @unchecked Sendable {
@@ -231,7 +235,11 @@ nonisolated final class FTPServer: @unchecked Sendable {
             case "DELE": delete(arg)
             case "MKD", "XMKD": makeDirectory(arg)
             case "NOOP": send("200 OK\r\n")
-            case "QUIT": send("221 Bye\r\n"); control.cancel()
+            case "QUIT":
+                // cancel() right after send() dropped the queued 221 — close
+                // only once the reply has actually gone out.
+                control.send(content: Data("221 Bye\r\n".utf8),
+                             completion: .contentProcessed { [weak self] _ in self?.close() })
             default: send("502 Command not implemented\r\n")
             }
         }
@@ -264,11 +272,10 @@ nonisolated final class FTPServer: @unchecked Sendable {
             }
             pasvListener = listener
             let q = server.workQueue
+            // Handlers already run on `q` (listener.start(queue: q) below).
             listener.newConnectionHandler = { [weak self] connection in
-                q.async {
-                    connection.start(queue: q)
-                    self?.pendingData = connection
-                }
+                connection.start(queue: q)
+                self?.pendingData = connection
             }
             listener.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
@@ -413,6 +420,12 @@ nonisolated final class FTPServer: @unchecked Sendable {
                 send("550 Writes are disabled\r\n"); return
             }
             guard let url = server.resolve(cwd, arg) else { send("550 Illegal path\r\n"); return }
+            // `STOR /` resolves to the root itself — the temp file would land in
+            // the root's PARENT and the promote step would delete the whole
+            // served folder. Never overwrite the root or any directory.
+            guard !server.isRoot(url), !directoryExists(url) else {
+                send("550 Not a file\r\n"); return
+            }
             // Stream into a temp file next to the target; promote on clean EOF,
             // discard on error. The old accumulate-in-RAM version also treated
             // a mid-upload connection error exactly like completion — saving a
@@ -493,7 +506,11 @@ nonisolated final class FTPServer: @unchecked Sendable {
         }
 
         private func delete(_ arg: String) {
+            // DELE is files only. A bare `DELE` / `DELE .` resolves to the root,
+            // and removeItem is recursive — it used to wipe the whole served
+            // folder (and `DELE subdir` a whole subtree) permanently.
             guard let server, server.writesAllowed, let url = server.resolve(cwd, arg),
+                  !server.isRoot(url), !directoryExists(url),
                   (try? FileManager.default.removeItem(at: url)) != nil else {
                 send("550 Cannot delete\r\n"); return
             }

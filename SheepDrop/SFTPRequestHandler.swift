@@ -252,7 +252,10 @@ nonisolated final class SFTPRequestHandler {
             return
         }
         let offset = message.pointee.offset
-        let length = Int(message.pointee.len)
+        // `len` is client-chosen (up to 4 GB): unclamped it forced a huge
+        // allocation and `Int32(data.count)` trapped past 2 GB. Short reads are
+        // legal SFTP — clients just ask again at the next offset.
+        let length = min(Int(message.pointee.len), 256 * 1024)
         do {
             try handle.seek(toOffset: offset)
             let data = try handle.read(upToCount: length) ?? Data()
