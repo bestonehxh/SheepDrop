@@ -231,6 +231,33 @@ struct SidebarOutline: NSViewRepresentable {
             }
         }
 
+        private func openTab(for host: HostEntry) -> SessionTab? {
+            model.tabs.first {
+                $0.host.address == host.address && $0.host.port == host.port
+                    && $0.host.username == host.username && $0.host.proto == host.proto
+            }
+        }
+
+        /// Deleting a group deletes every host in it, with no undo — it used
+        /// to happen on a single menu click.
+        private func confirmDelete(_ group: HostGroup) {
+            guard !group.hosts.isEmpty else { model.deleteGroup(group.id); return }
+            let alert = NSAlert()
+            alert.messageText = "Delete “\(group.name)”?"
+            let count = group.hosts.count
+            alert.informativeText = "This also deletes the \(count) saved host\(count == 1 ? "" : "s") in it. Stored passwords stay in the Keychain."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons.first?.hasDestructiveAction = true
+            // Return must not delete: make Cancel the default button.
+            alert.buttons[0].keyEquivalent = ""
+            alert.buttons[1].keyEquivalent = "\r"
+            if alert.runModal() == .alertFirstButtonReturn {
+                model.deleteGroup(group.id)
+            }
+        }
+
         func contextMenu(for node: SidebarItem) -> NSMenu {
             let menu = NSMenu()
             switch node.kind {
@@ -266,6 +293,9 @@ struct SidebarOutline: NSViewRepresentable {
                         move.submenu = sub
                         menu.addItem(move)
                     }
+                    if let tab = openTab(for: host) {
+                        menu.addItem(MenuAction(title: "Disconnect") { [self] in model.closeTab(tab) })
+                    }
                     menu.addItem(MenuAction(title: "Delete Host") { [self] in model.deleteHost(host) })
                 }
             case .group:
@@ -273,7 +303,19 @@ struct SidebarOutline: NSViewRepresentable {
                     menu.addItem(MenuAction(title: "New Host in “\(group.name)”") { [self] in
                         model.pendingGroupID = group.id; model.showQuickConnect = true
                     })
-                    menu.addItem(MenuAction(title: "Delete Group") { [self] in model.deleteGroup(group.id) })
+                    menu.addItem(.separator())
+                    // Rename / reorder existed only in the old SwiftUI sidebar
+                    // and were lost when the list moved to NSOutlineView.
+                    menu.addItem(MenuAction(title: "Rename…") { [self] in model.renameGroupRequest = group.id })
+                    let index = model.groups.firstIndex { $0.id == group.id } ?? 0
+                    if index > 0 {
+                        menu.addItem(MenuAction(title: "Move Up") { [self] in model.moveGroup(group.id, up: true) })
+                    }
+                    if index < model.groups.count - 1 {
+                        menu.addItem(MenuAction(title: "Move Down") { [self] in model.moveGroup(group.id, up: false) })
+                    }
+                    menu.addItem(.separator())
+                    menu.addItem(MenuAction(title: "Delete Group…") { [self] in confirmDelete(group) })
                 }
             case .section:
                 break
@@ -447,10 +489,15 @@ private struct OutlineHostContent: View {
     let isRecent: Bool
     @ObservedObject private var model = AppModel.shared
 
+    /// Green only for a tab that is actually connected to THIS host — a failed
+    /// attempt used to show green (`!= .disconnected`), and address+protocol
+    /// alone lit up every saved entry for the same device.
     private var isConnected: Bool {
         model.tabs.contains {
-            $0.host.address == host.address && $0.host.proto == host.proto
-                && $0.status != .disconnected
+            guard $0.host.address == host.address, $0.host.port == host.port,
+                  $0.host.username == host.username, $0.host.proto == host.proto else { return false }
+            if case .connected = $0.status { return true }
+            return false
         }
     }
 

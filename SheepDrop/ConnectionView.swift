@@ -9,7 +9,10 @@ import UniformTypeIdentifiers
 struct ConnectionView: View {
     @ObservedObject var tab: SessionTab
     @ObservedObject private var model = AppModel.shared
-    @StateObject private var localPane = LocalPaneModel()
+    /// Owned by the tab: as view @StateObject it was recreated on every tab
+    /// switch / Transfers / Serve visit, so the local folder snapped back to
+    /// ~ and a download landed somewhere other than the folder on screen.
+    private var localPane: LocalPaneModel { tab.localPane }
     @State private var searchText = ""
 
     private var session: SFTPSession? { tab.sftp }
@@ -20,13 +23,11 @@ struct ConnectionView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
-            Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
             HSplitPanes(tab: tab, localPane: localPane, searchText: searchText)
             if let session { ActiveTransferBar(session: session) }
             TransfersDrawer()
             statusBar
         }
-        .background(Theme.content, ignoresSafeAreaEdges: [])
         .onAppear { tab.sftp?.startIfNeeded() }
         .background {
             // The password sheet MUST be hosted by a view that observes the
@@ -48,6 +49,7 @@ struct ConnectionView: View {
                 session?.goUp()
             }
             .help("Parent folder")
+            .glassCapsule(interactive: true)
 
             // Breadcrumb pill
             HStack(spacing: 6) {
@@ -67,10 +69,10 @@ struct ConnectionView: View {
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 10)
-            .frame(height: 28)
+            .padding(.horizontal, 12)
+            .frame(height: 30)
             .frame(maxWidth: .infinity)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.well))
+            .glassCapsule()
 
             // Search
             HStack(spacing: 6) {
@@ -82,9 +84,9 @@ struct ConnectionView: View {
                     .font(.system(size: 12.5))
                     .foregroundStyle(Theme.text)
             }
-            .padding(.horizontal, 9)
-            .frame(width: 178, height: 28)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.well))
+            .padding(.horizontal, 11)
+            .frame(width: 190, height: 30)
+            .glassCapsule()
 
             ToolbarIcon(systemName: "arrow.clockwise", enabled: true) {
                 // A remote listing only exists for SFTP/FTP. On SCP/TFTP the
@@ -94,6 +96,7 @@ struct ConnectionView: View {
                 if canBrowse { session?.refresh() }
                 localPane.reload()
             }
+            .glassCapsule(interactive: true)
 
             // Queue toggle
             Button {
@@ -106,18 +109,17 @@ struct ConnectionView: View {
                         .font(.system(size: 12.5, weight: .medium))
                 }
                 .foregroundStyle(model.drawerOpen ? .white : Theme.text2)
-                .padding(.horizontal, 10)
-                .frame(height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 7)
-                        .fill(model.drawerOpen ? Theme.accent : Theme.control)
-                )
+                .padding(.horizontal, 12)
+                .frame(height: 30)
+                .contentShape(.capsule)
+                .glassEffect(model.drawerOpen ? .regular.tint(Theme.accent).interactive() : .regular.interactive(),
+                             in: .capsule)
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 14)
+        .padding(.leading, 6)
+        .padding(.trailing, 14)
         .frame(height: 52)
-        .background(Theme.header, ignoresSafeAreaEdges: [])
     }
 
     private var canGoUp: Bool {
@@ -155,10 +157,6 @@ struct ConnectionView: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 26)
-        .background(Theme.header, ignoresSafeAreaEdges: [])
-        .overlay(alignment: .top) {
-            Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
-        }
     }
 
     private var securityLine: String {
@@ -211,11 +209,10 @@ struct ActiveTransferBar: View {
                     .tint(Theme.accent)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(Theme.header)
-            .overlay(alignment: .top) {
-                Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
-            }
+            .padding(.vertical, 10)
+            .glassCard()
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
         }
     }
 
@@ -252,11 +249,8 @@ struct ToolbarIcon: View {
             Image(systemName: systemName)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(enabled ? Theme.dimText : Theme.disabledText.opacity(0.6))
-                .frame(width: 28, height: 26)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(hovering && enabled ? Theme.hover : .clear)
-                )
+                .frame(width: 32, height: 30)
+                .contentShape(.capsule)
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
@@ -493,7 +487,6 @@ struct PaneStrip<Content: View>: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 34)
-        .background(Theme.header, ignoresSafeAreaEdges: [])
         .overlay(alignment: .bottom) {
             Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
         }
@@ -528,9 +521,10 @@ struct RemoteDisconnectedOverlay: View {
                     .font(.system(size: 12.5))
                     .foregroundStyle(Theme.dimText)
             } else {
-                RoundedRectangle(cornerRadius: 13)
-                    .fill(hasFailed ? Theme.err.opacity(0.12) : Theme.well)
-                    .frame(width: 52, height: 52)
+                Color.clear
+                    .frame(width: 56, height: 56)
+                    .glassEffect(hasFailed ? .regular.tint(Theme.err.opacity(0.35)) : .regular,
+                                 in: .rect(cornerRadius: 16))
                     .overlay(
                         Image(systemName: hasFailed ? "exclamationmark.triangle" : "server.rack")
                             .font(.system(size: 22, weight: .light))
@@ -551,16 +545,14 @@ struct RemoteDisconnectedOverlay: View {
                 } label: {
                     Text(hasFailed ? "Try Again" : "Connect")
                         .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 20)
-                        .frame(height: 30)
-                        .background(RoundedRectangle(cornerRadius: 7).fill(Theme.accent))
+                        .padding(.horizontal, 12)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.glassProminent)
+                .tint(Theme.accent)
+                .controlSize(.large)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.content)
     }
 
     private var hasFailed: Bool {
@@ -595,7 +587,7 @@ struct NoticeBar: View {
         .foregroundStyle(Theme.dimText)
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
-        .background(Theme.header)
+        .background(.regularMaterial)
         .overlay(alignment: .top) {
             Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
         }
@@ -631,9 +623,9 @@ struct BlindPane: View {
             VStack(spacing: 0) {
                 Spacer()
                 VStack(spacing: 16) {
-                    RoundedRectangle(cornerRadius: 13)
-                        .fill(Theme.well)
-                        .frame(width: 52, height: 52)
+                    Color.clear
+                        .frame(width: 56, height: 56)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 16))
                         .overlay(
                             Image(systemName: "eye.slash")
                                 .font(.system(size: 22, weight: .light))
@@ -660,9 +652,8 @@ struct BlindPane: View {
                             .font(.system(size: 12.5, design: .monospaced))
                             .foregroundStyle(Theme.text)
                             .padding(.horizontal, 10)
-                            .frame(height: 30)
-                            .background(RoundedRectangle(cornerRadius: 7).fill(Theme.content))
-                            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Theme.hairline, lineWidth: 0.5))
+                            .frame(height: 32)
+                            .glassEffect(.regular, in: .rect(cornerRadius: Glass.fieldRadius))
                         HStack(spacing: 8) {
                             BlindButton(title: "Put file", systemName: "arrow.up",
                                         prominent: true, enabled: canPut) { put() }
@@ -693,7 +684,6 @@ struct BlindPane: View {
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.content)
         }
     }
 
@@ -807,11 +797,10 @@ struct BlindButton: View {
             }
             .foregroundStyle(prominent ? .white : Theme.text)
             .frame(maxWidth: .infinity)
-            .frame(height: 30)
-            .background(
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(prominent ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.control))
-            )
+            .frame(height: 32)
+            .contentShape(.capsule)
+            .glassEffect(prominent ? .regular.tint(Theme.accent).interactive() : .regular.interactive(),
+                         in: .capsule)
             .opacity(enabled ? 1 : 0.45)
         }
         .buttonStyle(.plain)
@@ -849,7 +838,6 @@ struct TransfersDrawer: View {
             }
             .padding(.horizontal, 14)
             .frame(height: 32)
-            .background(Theme.header)
             .overlay(alignment: .top) {
                 Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
             }
@@ -878,7 +866,6 @@ struct TransfersDrawer: View {
                     .padding(.vertical, 6)
                 }
                 .frame(height: 138)
-                .background(Theme.content)
             }
         }
     }

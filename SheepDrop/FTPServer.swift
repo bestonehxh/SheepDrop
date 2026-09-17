@@ -40,11 +40,18 @@ nonisolated final class FTPServer: @unchecked Sendable {
     }
 
     func start() async throws -> UInt16 {
-        do { return try await listen(on: config.port) }
-        catch {
-            guard config.port != Self.fallbackPort else { throw error }
-            return try await listen(on: Self.fallbackPort)
+        // A restart (e.g. changing the served folder) cancels the previous
+        // listener asynchronously — binding at once found port 21 still held
+        // and silently moved to 2121, breaking devices on the default port.
+        // Give the old socket a moment before falling back.
+        for attempt in 0..<4 {
+            do { return try await listen(on: config.port) }
+            catch {
+                guard config.port != Self.fallbackPort else { throw error }
+                if attempt < 3 { try? await Task.sleep(for: .milliseconds(150)) }
+            }
         }
+        return try await listen(on: Self.fallbackPort)
     }
 
     func stop() {
@@ -273,9 +280,17 @@ nonisolated final class FTPServer: @unchecked Sendable {
             pasvListener = listener
             let q = server.workQueue
             // Handlers already run on `q` (listener.start(queue: q) below).
+            // Only the control connection's own host may attach, and only once:
+            // any host could connect to the PASV port and receive (RETR) or
+            // inject (STOR) the data, and a second connect silently replaced
+            // (and leaked) the first.
             listener.newConnectionHandler = { [weak self] connection in
+                guard let self, self.pendingData == nil,
+                      Self.sameHost(connection.endpoint, self.control.endpoint) else {
+                    connection.cancel(); return
+                }
                 connection.start(queue: q)
-                self?.pendingData = connection
+                self.pendingData = connection
             }
             listener.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
@@ -301,20 +316,38 @@ nonisolated final class FTPServer: @unchecked Sendable {
             }
             let port = UInt16(n[4] * 256 + n[5])
             guard port > 0 else { send("501 Bad PORT\r\n"); return }
-            portTarget = ("\(n[0]).\(n[1]).\(n[2]).\(n[3])", port)
+            let host = "\(n[0]).\(n[1]).\(n[2]).\(n[3])"
+            // FTP bounce: PORT must point back at the client itself, not make
+            // this Mac dial an arbitrary third host.
+            if let peerV4 = Self.ipv4(of: control.endpoint), peerV4 != host {
+                send("501 PORT must name your own address\r\n"); return
+            }
+            portTarget = (host, port)
             pasvListener?.cancel(); pasvListener = nil; pendingData = nil
             send("200 PORT command successful\r\n")
         }
 
         /// Resolves the data connection (waits for the PASV connect, or dials
-        /// the PORT target), runs `body`, then closes it.
-        private func withData(_ body: @escaping @Sendable (NWConnection, @escaping @Sendable () -> Void) -> Void) {
-            guard let server else { return }
+        /// the PORT target), runs `body`, then closes it. If no data connection
+        /// comes up, `onFail` releases the caller's resources and the client
+        /// gets a 425 — a failed PORT dial used to leave it waiting forever,
+        /// and the PASV 425 path leaked RETR/STOR file handles and temp files.
+        private func withData(onFail: @escaping @Sendable () -> Void = {},
+                              _ body: @escaping @Sendable (NWConnection, @escaping @Sendable () -> Void) -> Void) {
+            guard let server else { onFail(); return }
             if let target = portTarget, let port = NWEndpoint.Port(rawValue: target.port) {
                 let connection = NWConnection(host: .init(target.host), port: port, using: .tcp)
-                connection.stateUpdateHandler = { state in
-                    if case .ready = state {
-                        body(connection) { connection.cancel() }
+                let once = Once()
+                connection.stateUpdateHandler = { [weak self] state in
+                    switch state {
+                    case .ready:
+                        if once.claim() { body(connection) { connection.cancel() } }
+                    case .failed, .waiting:
+                        if once.claim() {
+                            connection.cancel(); onFail()
+                            self?.send("425 Cannot open data connection\r\n")
+                        }
+                    default: break
                     }
                 }
                 connection.start(queue: server.workQueue)
@@ -322,27 +355,60 @@ nonisolated final class FTPServer: @unchecked Sendable {
                 return
             }
             // Passive: the client may not have connected yet — poll briefly.
-            waitForPassive(attempt: 0, body)
+            waitForPassive(attempt: 0, onFail: onFail, body)
         }
 
-        private func waitForPassive(attempt: Int, _ body: @escaping @Sendable (NWConnection, @escaping @Sendable () -> Void) -> Void) {
+        private func waitForPassive(attempt: Int, onFail: @escaping @Sendable () -> Void,
+                                    _ body: @escaping @Sendable (NWConnection, @escaping @Sendable () -> Void) -> Void) {
             if let connection = pendingData {
                 pendingData = nil
                 let listener = pasvListener; pasvListener = nil
                 body(connection) { connection.cancel(); listener?.cancel() }
                 return
             }
-            guard attempt < 100 else {
+            guard attempt < 100, pasvListener != nil else {
+                pasvListener?.cancel(); pasvListener = nil
+                onFail()
                 send("425 Data connection not established\r\n"); return
             }
             server?.workQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.waitForPassive(attempt: attempt + 1, body)
+                guard let self else { onFail(); return }
+                self.waitForPassive(attempt: attempt + 1, onFail: onFail, body)
             }
         }
 
         private var peerHost: String {
             if case let .hostPort(host, _) = control.endpoint { return "\(host)" }
             return "127.0.0.1"
+        }
+
+        /// Fires its guarded branch once — NWConnection can report .waiting
+        /// and then .failed for the same dial. Touched only on the server queue.
+        private final class Once: @unchecked Sendable {
+            private var used = false
+            func claim() -> Bool { defer { used = true }; return !used }
+        }
+
+        /// The endpoint's IPv4 address as dotted text (IPv4-mapped IPv6
+        /// included), or nil for a real IPv6 peer.
+        static func ipv4(of endpoint: NWEndpoint) -> String? {
+            guard case let .hostPort(host, _) = endpoint else { return nil }
+            switch host {
+            case .ipv4(let a): return "\(a)".components(separatedBy: "%").first
+            case .ipv6(let a):
+                let text = "\(a)".components(separatedBy: "%").first ?? ""
+                return text.lowercased().hasPrefix("::ffff:") ? String(text.dropFirst(7)) : nil
+            case .name(let n, _): return n
+            @unknown default: return nil
+            }
+        }
+
+        /// Data connection from the same host as the control connection. An
+        /// IPv6 control peer is let through (PASV only advertises IPv4, so
+        /// there's nothing comparable).
+        static func sameHost(_ data: NWEndpoint, _ control: NWEndpoint) -> Bool {
+            guard let peer = ipv4(of: control) else { return true }
+            return ipv4(of: data) == peer
         }
 
         // MARK: Transfers
@@ -375,7 +441,7 @@ nonisolated final class FTPServer: @unchecked Sendable {
             // whole file (700 MB firmware!) in RAM and blocked the shared
             // server queue for the duration of the read, freezing every other
             // session's control replies.
-            guard let server, let url = server.resolve(cwd, arg),
+            guard let server, let url = server.resolve(cwd, arg), !directoryExists(url),
                   let handle = try? FileHandle(forReadingFrom: url) else {
                 send("550 File not found\r\n"); return
             }
@@ -383,7 +449,7 @@ nonisolated final class FTPServer: @unchecked Sendable {
             let peer = peer
             let q = server.workQueue
             let session = self
-            withData { connection, done in
+            withData(onFail: { try? handle.close() }) { connection, done in
                 let tally = Tally()
                 @Sendable func pump() {
                     let chunk = (try? handle.read(upToCount: 512 * 1024)).flatMap { $0 }
@@ -442,7 +508,10 @@ nonisolated final class FTPServer: @unchecked Sendable {
             send("150 Ready to receive\r\n")
             let peer = peer
             let session = self
-            withData { connection, done in
+            withData(onFail: {
+                try? handle.close()
+                try? FileManager.default.removeItem(at: tempURL)
+            }) { connection, done in
                 let tally = Tally()
                 @Sendable func fail(_ reply: String) {
                     try? handle.close()

@@ -30,6 +30,42 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
     private let stateLock = NSLock()
     private var bind: OpaquePointer?
     private var running = false
+    private let live = LiveSessions()
+
+    /// Sockets of the connections currently being served, so stop() can end
+    /// them (it used to stop only the listener — logged-in SFTP/SCP clients
+    /// kept reading and writing after the toggle said "Off").
+    ///
+    /// fd-reuse safety: a serve thread calls remove() BEFORE ssh_free closes
+    /// its fd, and shutdownAll() runs under the same lock, so it can never hit
+    /// an fd number that has already been closed and handed to someone else.
+    private final class LiveSessions: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fds: [UUID: Int32] = [:]
+        private var stopped = false
+        /// Returns nil if the server is already stopping — the caller must drop
+        /// the connection instead of serving it.
+        func add(_ fd: Int32) -> UUID? {
+            lock.lock(); defer { lock.unlock() }
+            guard !stopped else { return nil }
+            let id = UUID(); fds[id] = fd; return id
+        }
+        func remove(_ id: UUID) {
+            lock.lock(); fds[id] = nil; lock.unlock()
+        }
+        func shutdownAll() {
+            lock.lock(); defer { lock.unlock() }
+            stopped = true
+            for fd in fds.values { Darwin.shutdown(fd, SHUT_RDWR) }
+        }
+    }
+
+    /// Handshake + login must finish within this; a silent TCP connection used
+    /// to hold a thread forever.
+    private static let handshakeTimeout = 30
+    /// Raised once logged in, so the short handshake limit can't cut off a
+    /// person browsing slowly.
+    private static let sessionTimeout = 600
     /// Read per write-op so flipping "Allow writes" applies to a running server.
     private let allowWritesNow: @Sendable () -> Bool
 
@@ -78,11 +114,27 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
         return try await withCheckedThrowingContinuation { continuation in
             acceptQueue.async { [self] in
                 do {
+                    // On a restart the previous server's accept thread frees
+                    // its bind asynchronously; retry 22 briefly before falling
+                    // back, or a folder change silently moved us to 2222 and
+                    // switches (which can't name a port) got "refused".
+                    var bound: UInt16?
+                    var lastError: Error?
+                    for attempt in 0..<4 where bound == nil {
+                        do {
+                            bound = try bindAndListen(hostKeyPaths: hostKeyPaths, port: config.port)
+                        } catch {
+                            lastError = error
+                            if attempt < 3 { usleep(150_000) }
+                        }
+                    }
                     let port: UInt16
-                    do {
-                        port = try bindAndListen(hostKeyPaths: hostKeyPaths, port: config.port)
-                    } catch {
-                        guard config.port != Self.fallbackPort else { throw error }
+                    if let bound {
+                        port = bound
+                    } else {
+                        guard config.port != Self.fallbackPort else {
+                            throw lastError ?? SFTPError(message: "cannot listen on port \(config.port)")
+                        }
                         port = try bindAndListen(hostKeyPaths: hostKeyPaths, port: Self.fallbackPort)
                     }
                     stateLock.lock(); running = true; stateLock.unlock()
@@ -112,6 +164,7 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
         running = false
         let bind = bind
         stateLock.unlock()
+        live.shutdownAll()
         if let bind {
             let fd = ssh_bind_get_fd(bind)
             if fd >= 0 {
@@ -169,16 +222,28 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
             if ssh_bind_accept(bind, session) != SSH_OK {
                 ssh_free(session)
                 if !isRunning { break }
+                // e.g. EMFILE: accept fails instantly and would spin a core.
+                usleep(100_000)
                 continue
             }
-            guard isRunning else { ssh_free(session); break }
+            guard isRunning, let liveID = live.add(ssh_get_fd(session)) else {
+                ssh_free(session); break
+            }
+            var timeout = Self.handshakeTimeout
+            ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout)
+            // Channel reads after login may block without libssh's timeout;
+            // keepalive lets the kernel eventually fail a vanished peer.
+            var on: Int32 = 1
+            setsockopt(ssh_get_fd(session), SOL_SOCKET, SO_KEEPALIVE, &on, socklen_t(MemoryLayout<Int32>.size))
             let config = self.config
             let onLog = self.onLog
             let onProgress = self.onProgress
             let allowWrites = self.allowWritesNow
+            let live = self.live
             Thread.detachNewThread {
                 Self.serve(session: session, config: config,
-                           allowWrites: allowWrites, onLog: onLog, onProgress: onProgress)
+                           allowWrites: allowWrites, onLog: onLog, onProgress: onProgress,
+                           done: { live.remove(liveID) })
             }
         }
         // Cleanup on this thread — the same one every other call on this bind
@@ -248,8 +313,10 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
                               config: Config,
                               allowWrites: @escaping @Sendable () -> Bool,
                               onLog: @escaping @Sendable (TFTPLogEntry) -> Void,
-                              onProgress: @escaping ServeProgress) {
+                              onProgress: @escaping ServeProgress,
+                              done: () -> Void) {
         defer {
+            done()                    // deregister BEFORE ssh_free closes the fd
             ssh_disconnect(session)
             ssh_free(session)
         }
@@ -275,6 +342,8 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
         guard let (channel, request) = openChannel(session) else {
             return
         }
+        var idle = sessionTimeout
+        ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &idle)
         switch request {
         case .sftp:
             guard let sftp = sftp_server_new(session, channel) else {

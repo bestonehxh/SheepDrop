@@ -35,6 +35,9 @@ nonisolated final class SFTPRequestHandler {
         var bytes: Int64 = 0
         var total: Int64 = 0
         var lastReported: Int64 = 0
+        /// Write handles stream into `tempURL`; CLOSE promotes it to `finalURL`.
+        var tempURL: URL?
+        var finalURL: URL?
         init(kind: Kind, name: String) { self.kind = kind; self.name = name }
     }
 
@@ -74,6 +77,9 @@ nonisolated final class SFTPRequestHandler {
             let box = Unmanaged<OpenHandle>.fromOpaque(raw).takeRetainedValue()
             if case .file(let file, let isWrite) = box.kind {
                 try? file.close()
+                // Interrupted upload: the real file was never touched; drop
+                // the partial temp.
+                if let temp = box.tempURL { try? FileManager.default.removeItem(at: temp) }
                 onProgress(ServeTransfer(token: token, peer: peer, name: box.name, isUpload: isWrite,
                                          done: box.bytes, total: max(box.total, box.bytes),
                                          state: .failed))
@@ -221,15 +227,34 @@ nonisolated final class SFTPRequestHandler {
                 log(isWrite: true, name: virtualPath(for: url), detail: "rejected (writes off)", failed: true)
                 return
             }
-            if flags & UInt32(SSH_FXF_CREAT) != 0 || !FileManager.default.fileExists(atPath: url.path) {
-                FileManager.default.createFile(atPath: url.path, contents: nil)
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            let exists = fm.fileExists(atPath: url.path, isDirectory: &isDir)
+            guard url.path != root.path, !(exists && isDir.boolValue) else {
+                _ = sftp_reply_status(message, UInt32(SSH_FX_FAILURE), "is a directory")
+                return
             }
-            guard let handle = try? FileHandle(forWritingTo: url) else {
+            // Stream into a hidden temp next to the target and promote it on
+            // CLOSE — writing in place truncated the existing file up front and
+            // left a half-written backup if the device dropped mid-transfer.
+            // Without TRUNC the client may write at offsets into the existing
+            // content, so seed the temp with a copy of it.
+            let temp = url.deletingLastPathComponent()
+                .appendingPathComponent(".sheepdrop-sftp-\(UUID().uuidString)")
+            if exists && flags & UInt32(SSH_FXF_TRUNC) == 0 {
+                try? fm.copyItem(at: url, to: temp)
+            }
+            if !fm.fileExists(atPath: temp.path) {
+                fm.createFile(atPath: temp.path, contents: nil)
+            }
+            guard let handle = try? FileHandle(forWritingTo: temp) else {
+                try? fm.removeItem(at: temp)
                 _ = sftp_reply_status(message, UInt32(SSH_FX_FAILURE), "cannot open for writing")
                 return
             }
-            if flags & UInt32(SSH_FXF_TRUNC) != 0 { try? handle.truncate(atOffset: 0) }
             let box = OpenHandle(kind: .file(handle, isWrite: true), name: virtualPath(for: url))
+            box.tempURL = temp
+            box.finalURL = url
             log(isWrite: true, name: box.name, detail: "receiving", failed: false)
             reply(handleFor: box, to: message)
         } else {
@@ -309,6 +334,15 @@ nonisolated final class SFTPRequestHandler {
             liveHandles.remove(raw)
             if case .file(let file, let isWrite) = box.kind {
                 try? file.close()
+                if let temp = box.tempURL, let final = box.finalURL, !promote(temp, to: final) {
+                    sftp_handle_remove(sftp, raw)
+                    log(isWrite: true, name: box.name, detail: "could not save", failed: true)
+                    onProgress(ServeTransfer(token: token, peer: peer, name: box.name, isUpload: true,
+                                             done: box.bytes, total: max(box.total, box.bytes),
+                                             state: .failed))
+                    _ = sftp_reply_status(message, UInt32(SSH_FX_FAILURE), "write failed")
+                    return
+                }
                 if isWrite { log(isWrite: true, name: box.name, detail: "received", failed: false) }
                 else { log(isWrite: false, name: box.name, detail: "sent", failed: false) }
                 // Keep the completed transfer as a history row (loop()'s
@@ -320,6 +354,23 @@ nonisolated final class SFTPRequestHandler {
             sftp_handle_remove(sftp, raw)
         }
         _ = sftp_reply_status(message, UInt32(SSH_FX_OK), nil)
+    }
+
+    /// Moves a finished upload's temp over the real file. On failure the temp
+    /// is removed and the real file is left as it was.
+    private func promote(_ temp: URL, to final: URL) -> Bool {
+        let fm = FileManager.default
+        do {
+            if fm.fileExists(atPath: final.path) {
+                _ = try fm.replaceItemAt(final, withItemAt: temp)
+            } else {
+                try fm.moveItem(at: temp, to: final)
+            }
+            return true
+        } catch {
+            try? fm.removeItem(at: temp)
+            return false
+        }
     }
 
     // MARK: - Handle plumbing

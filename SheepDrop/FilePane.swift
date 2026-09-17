@@ -207,7 +207,7 @@ struct FileRow: View {
         .padding(.horizontal, 8)
         .frame(height: 28)
         .background(
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: 8)
                 .fill(isSelected ? Theme.accent : .clear)
         )
     }

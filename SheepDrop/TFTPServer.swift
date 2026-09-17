@@ -80,12 +80,18 @@ nonisolated final class TFTPServer: @unchecked Sendable {
 
     /// Binds and returns the actual port (preferred, or the fallback).
     func start(preferredPort: UInt16 = 69) async throws -> UInt16 {
-        do {
-            return try await listen(on: preferredPort)
-        } catch {
-            guard preferredPort != Self.fallbackPort else { throw error }
-            return try await listen(on: Self.fallbackPort)
+        // Retry the standard port briefly: on a restart the previous
+        // listener's cancel is still in flight, and binding at once fell back
+        // to 6969 — devices using plain tftp://mac/ then got no answer.
+        for attempt in 0..<4 {
+            do {
+                return try await listen(on: preferredPort)
+            } catch {
+                guard preferredPort != Self.fallbackPort else { throw error }
+                if attempt < 3 { try? await Task.sleep(for: .milliseconds(150)) }
+            }
         }
+        return try await listen(on: Self.fallbackPort)
     }
 
     func stop() {
@@ -199,6 +205,26 @@ nonisolated final class TFTPServer: @unchecked Sendable {
         private var readHandle: FileHandle?
         private var fileSize: Int = 0
         private var writeHandle: FileHandle?
+        private var writeTemp: URL?
+        private var writeFinal: URL?
+
+        /// Moves the finished upload over the real file; clears `writeTemp`
+        /// on success so finish() won't delete it.
+        private func promoteWrite() -> Bool {
+            guard let temp = writeTemp, let final = writeFinal else { return false }
+            let fm = FileManager.default
+            do {
+                if fm.fileExists(atPath: final.path) {
+                    _ = try fm.replaceItemAt(final, withItemAt: temp)
+                } else {
+                    try fm.moveItem(at: temp, to: final)
+                }
+                writeTemp = nil
+                return true
+            } catch {
+                return false
+            }
+        }
         private var writtenBytes: Int = 0
         private var expectedTotal: Int?
         private var currentBlock: UInt16 = 0   // last block sent (read) / acked (write)
@@ -316,14 +342,27 @@ nonisolated final class TFTPServer: @unchecked Sendable {
                     sendError(2, "writes are disabled on this server")
                     return
                 }
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                    sendError(2, "is a directory")
+                    return
+                }
                 try? FileManager.default.createDirectory(
                     at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-                guard let handle = try? FileHandle(forWritingTo: url) else {
+                // Receive into a hidden temp; the real file is replaced only
+                // once the last block arrives. Truncating it up front destroyed
+                // the previous backup and left a partial one on a dropped link.
+                let temp = url.deletingLastPathComponent()
+                    .appendingPathComponent(".sheepdrop-tftp-\(UUID().uuidString)")
+                FileManager.default.createFile(atPath: temp.path, contents: nil)
+                guard let handle = try? FileHandle(forWritingTo: temp) else {
+                    try? FileManager.default.removeItem(at: temp)
                     sendError(2, "cannot create file")
                     return
                 }
                 writeHandle = handle
+                writeTemp = temp
+                writeFinal = url
             } else {
                 guard let handle = try? FileHandle(forReadingFrom: url),
                       let size = try? FileManager.default
@@ -483,14 +522,23 @@ nonisolated final class TFTPServer: @unchecked Sendable {
                 currentBlock = block
                 reportProgress(done: writtenBytes, total: expectedTotal ?? 0, isUpload: true)
             }
-            sendAck(block)
-            if payload.count < blockSize {
+            // Last block = a short payload on the block we just wrote (a short
+            // duplicate of an older block must not end the transfer).
+            if block == currentBlock && payload.count < blockSize {
                 try? handle.close()
                 writeHandle = nil
+                // Promote BEFORE the final ACK, so the device only hears
+                // success once the file is really in place.
+                guard promoteWrite() else {
+                    sendError(3, "could not save file")
+                    return
+                }
+                sendAck(block)
                 reportDone(done: writtenBytes, isUpload: true)
                 finish("received \(ByteFormat.string(Int64(writtenBytes)))")
                 return
             }
+            sendAck(block)
             receiveNext()
         }
 
@@ -540,6 +588,9 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             readHandle = nil
             try? writeHandle?.close()
             writeHandle = nil
+            // Still holding a temp ⇒ the upload never completed; discard it.
+            if let temp = writeTemp { try? FileManager.default.removeItem(at: temp) }
+            writeTemp = nil
             if let detail {
                 server.log(peer: peer, isWrite: isWrite, filename: filename,
                            detail: detail, failed: failed)

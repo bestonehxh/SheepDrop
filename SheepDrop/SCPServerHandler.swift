@@ -148,8 +148,17 @@ nonisolated final class SCPServerHandler {
             return
         }
         _ = writeByte(0)                       // tell the source we're ready
-        guard let header = readLine(), header.hasPrefix("C") else {
-            sendError("expected file header"); return
+        // `scp -p` sends a `T<mtime> 0 <atime> 0` line before the C header; ack
+        // and skip it (it used to be rejected as "expected file header").
+        var nextLine = readLine()
+        while let line = nextLine, line.hasPrefix("T") {
+            _ = writeByte(0)
+            nextLine = readLine()
+        }
+        guard let header = nextLine, header.hasPrefix("C") else {
+            sendError(nextLine?.hasPrefix("D") == true ? "directories are not supported"
+                                                       : "expected file header")
+            return
         }
         // C<mode> <size> <name>
         let parts = header.dropFirst().split(separator: " ", maxSplits: 2).map(String.init)
@@ -173,6 +182,13 @@ nonisolated final class SCPServerHandler {
         let destStd = destination.standardizedFileURL.path
         guard destStd == root.path || destStd.hasPrefix(rootPath) else {
             sendError("illegal path"); return
+        }
+        // Never replace a directory: a pushed name matching an existing
+        // subfolder used to hit removeItem (recursive) at promote time.
+        var destIsDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: destination.path, isDirectory: &destIsDir),
+           destIsDir.boolValue {
+            sendError("\(name) is a directory"); return
         }
 
         // Stream into a temp file; promote on success, discard on error —
@@ -207,8 +223,16 @@ nonisolated final class SCPServerHandler {
             received += chunk.count
             reportProgress(name: name, isUpload: true, done: Int64(received), total: Int64(size), lastReported: &lastReported)
         }
-        _ = readByte()                         // trailing \0 from source
+        // Trailing status from the source: \0 = the data is good. OpenSSH scp
+        // pads with zeros and sends an error here if IT hit a read error, so
+        // anything else means the bytes we hold are not the file.
+        let status = readByte()
         try? handle.close()
+        guard status == 0 else {
+            if status != nil { _ = readLine() }   // swallow the source's message
+            try? FileManager.default.removeItem(at: tempURL)
+            sendError("source reported an error; file discarded"); return
+        }
         do {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)

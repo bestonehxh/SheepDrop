@@ -78,3 +78,43 @@ enum Theme {
         )
     }
 }
+
+// MARK: - Liquid Glass (macOS 26+ design language)
+
+/// Shared glass shapes so every surface uses the same radii: cards/overlays use `card`, controls
+/// are capsules.
+enum Glass {
+    static let cardRadius: CGFloat = 16
+    static let fieldRadius: CGFloat = 10
+}
+
+extension View {
+    /// A content card floating on Liquid Glass (Serve steps, overlays).
+    func glassCard(cornerRadius: CGFloat = Glass.cardRadius) -> some View {
+        glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+    }
+
+    /// A capsule control surface (breadcrumb, search, icon groups).
+    func glassCapsule(interactive: Bool = false) -> some View {
+        glassEffect(interactive ? .regular.interactive() : .regular, in: .capsule)
+    }
+}
+
+/// Behind-window vibrancy, the same helper SheepTerm's GlassChrome uses for its
+/// sidebar. Follows the window's light/dark appearance (SheepDrop is not
+/// dark-only, so no appearance override here).
+struct VisualEffectBackground: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+    }
+}

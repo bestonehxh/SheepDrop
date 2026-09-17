@@ -95,11 +95,14 @@ enum ConnectionStatus: Equatable, Sendable {
 @MainActor
 final class SessionTab: ObservableObject, Identifiable {
     nonisolated let id = UUID()
-    let host: HostEntry
+    /// Mutable only for the username correction from the password sheet.
+    @Published private(set) var host: HostEntry
     @Published var status: ConnectionStatus = .disconnected
     /// Live SFTP connection — owned here, not by the view, so it survives
     /// tab switches. nil for protocols the SFTP engine doesn't serve.
     let sftp: SFTPSession?
+    /// The Mac-side pane's folder/selection — per tab, surviving view rebuilds.
+    let localPane = LocalPaneModel()
     private var sessionObserver: AnyCancellable?
 
     init(host: HostEntry) {
@@ -122,6 +125,10 @@ final class SessionTab: ObservableObject, Identifiable {
 
     func shutdown() {
         sftp?.disconnect()
+    }
+
+    func setUsername(_ username: String) {
+        host.username = username
     }
 
     var title: String { "\(host.displayName) · \(host.proto.label)" }

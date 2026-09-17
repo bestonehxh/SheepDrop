@@ -30,7 +30,7 @@ struct ServeView: View {
     var body: some View {
         VStack(spacing: 0) {
             PaneStrip {
-                Image(systemName: "server.rack")
+                Image(systemName: "tray.and.arrow.down")
                     .font(.system(size: 12))
                     .foregroundStyle(anyServerRunning ? Theme.ok : Theme.dimText)
                 Text("Serve")
@@ -56,9 +56,7 @@ struct ServeView: View {
                 .frame(maxWidth: 640)
                 .frame(maxWidth: .infinity)
             }
-            .background(Theme.content)
         }
-        .background(Theme.content, ignoresSafeAreaEdges: [])
     }
 
     private var anyServerRunning: Bool {
@@ -85,8 +83,9 @@ struct ServeView: View {
                 .foregroundStyle(Theme.faintText)
                 .lineSpacing(2)
         }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.sidebar))
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard()
     }
 
     private var protocolHint: String {
@@ -136,8 +135,9 @@ struct ServeView: View {
             }
             if selectedRunning { reachAddressRow }
         }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.sidebar))
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard()
     }
 
     private var transportStatus: String {
@@ -205,7 +205,7 @@ struct ServeView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 7).fill(Theme.content))
+        .background(RoundedRectangle(cornerRadius: Glass.fieldRadius).fill(Theme.content.opacity(0.7)))
         .overlay(RoundedRectangle(cornerRadius: 7).stroke(Theme.hairlineSoft, lineWidth: 0.5))
     }
 
@@ -369,11 +369,12 @@ struct ServeView: View {
                         TFTPLogRow(entry: entry)
                     }
                 }
-                .background(RoundedRectangle(cornerRadius: 7).fill(Theme.content))
+                .background(RoundedRectangle(cornerRadius: Glass.fieldRadius).fill(Theme.content.opacity(0.7)))
             }
         }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.sidebar))
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard()
     }
 
     /// Upload/download bar for the transfer a device is running (or just
@@ -395,8 +396,9 @@ struct ServeView: View {
                     .frame(maxWidth: .infinity)
             }
         }
-        .padding(14)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Theme.sidebar))
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard()
         .animation(.easeInOut(duration: 0.15), value: model.activeServeTransfer)
     }
 

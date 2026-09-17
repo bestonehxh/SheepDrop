@@ -42,6 +42,8 @@ final class AppModel: ObservableObject {
     @Published var groups: [HostGroup]
     @Published var recents: [HostEntry]
     @Published var showQuickConnect = false
+    /// Group whose Rename alert should show (set by the sidebar context menu).
+    @Published var renameGroupRequest: UUID?
     /// Preselects a group in the QuickConnect sheet (from a group's
     /// "New Host in …" menu). Consumed and cleared by the sheet.
     var pendingGroupID: UUID?
@@ -79,18 +81,49 @@ final class AppModel: ObservableObject {
     /// render (and re-renders on every request-log line), so the uncached
     /// version did a Keychain IPC round-trip per frame while a server was busy.
     private var cachedServerPassword: String?
+    private var serverPasswordLoad: Task<String?, Never>?
 
-    var sftpServerPassword: String {
+    private static var devServerPassword: String? {
         // Dev hook: bypass the Keychain (a CLI-injected item triggers a
-        // blocking access prompt on the main thread during launch).
-        if let index = CommandLine.arguments.firstIndex(of: "-demoSFTPPassword"),
-           CommandLine.arguments.indices.contains(index + 1) {
-            return CommandLine.arguments[index + 1]
-        }
+        // blocking access prompt during launch).
+        guard let index = CommandLine.arguments.firstIndex(of: "-demoSFTPPassword"),
+              CommandLine.arguments.indices.contains(index + 1) else { return nil }
+        return CommandLine.arguments[index + 1]
+    }
+
+    /// For rendering only: never touches the Keychain on the main thread (the
+    /// read can block on a SecurityAgent prompt). Kicks off a background load
+    /// and reads "" until it lands.
+    var sftpServerPassword: String {
+        if let dev = Self.devServerPassword { return dev }
         if let cached = cachedServerPassword { return cached }
-        let value = Keychain.password(account: Self.sftpKeychainAccount) ?? ""
-        cachedServerPassword = value
-        return value
+        _ = loadServerPassword()
+        return ""
+    }
+
+    /// The real value, for starting a server. A failed/denied read is NOT
+    /// cached — the next start retries (it used to stick as "" for the whole
+    /// session, so the server refused to start until relaunch).
+    func serverPassword() async -> String {
+        if let dev = Self.devServerPassword { return dev }
+        if let cached = cachedServerPassword { return cached }
+        return await loadServerPassword().value ?? ""
+    }
+
+    private func loadServerPassword() -> Task<String?, Never> {
+        if let serverPasswordLoad { return serverPasswordLoad }
+        let account = Self.sftpKeychainAccount
+        let task = Task { @MainActor [weak self] () -> String? in
+            let value = await Task.detached { Keychain.password(account: account) }.value
+            guard let self else { return value }
+            // A password typed while this read was in flight wins.
+            if let typed = self.cachedServerPassword { return typed }
+            if let value { self.cachedServerPassword = value; self.objectWillChange.send() }
+            self.serverPasswordLoad = nil     // allow a retry after a failure
+            return value
+        }
+        serverPasswordLoad = task
+        return task
     }
 
     func setSFTPUsername(_ name: String) {
@@ -152,15 +185,24 @@ final class AppModel: ObservableObject {
         tabs.first { $0.id == selectedTabID }
     }
 
+    /// Sidebar host rows observe AppModel, not the tabs — without this forward
+    /// a host's green "connected" dot only updated on some unrelated redraw
+    /// (confirmed live: connected, still orange until a group rename).
+    private var tabStatusObservers: [UUID: AnyCancellable] = [:]
+
     func openTab(for host: HostEntry) {
         let tab = SessionTab(host: host)
         tabs.append(tab)
         selectedTabID = tab.id
+        tabStatusObservers[tab.id] = tab.$status.dropFirst().sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         noteRecent(host)
     }
 
     func closeTab(_ tab: SessionTab) {
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        tabStatusObservers[tab.id] = nil
         tab.shutdown()
         tabs.remove(at: index)
         if selectedTabID == tab.id {
@@ -270,6 +312,23 @@ final class AppModel: ObservableObject {
         hostStore.saveGroups(groups)
     }
 
+    /// Saved hosts and recents share the HostEntry id of the host they were
+    /// opened from, so one id update covers both.
+    func updateUsername(hostID: UUID, to username: String) {
+        var groupsChanged = false
+        for g in groups.indices {
+            for h in groups[g].hosts.indices where groups[g].hosts[h].id == hostID {
+                groups[g].hosts[h].username = username
+                groupsChanged = true
+            }
+        }
+        if groupsChanged { hostStore.saveGroups(groups) }
+        if let r = recents.firstIndex(where: { $0.id == hostID }) {
+            recents[r].username = username
+            hostStore.saveRecents(recents)
+        }
+    }
+
     func removeRecent(_ host: HostEntry) {
         recents.removeAll { $0.id == host.id }
         hostStore.saveRecents(recents)
@@ -322,9 +381,20 @@ final class AppModel: ObservableObject {
 
     // MARK: - FTP server lifecycle
 
+    /// Bumped on every on/off, so a start that is still awaiting the Keychain
+    /// can tell it was superseded by an "off" (or a newer "on").
+    private var ftpStartGeneration = 0
+    private var sftpStartGeneration = 0
+
     func setFTPServer(on: Bool) {
+        ftpStartGeneration += 1
         if on {
-            startFTPServer()
+            let generation = ftpStartGeneration
+            Task {
+                let password = await serverPassword()
+                guard generation == ftpStartGeneration else { return }
+                startFTPServer(password: password)
+            }
         } else {
             ftpServer?.stop()
             ftpServer = nil
@@ -341,9 +411,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startFTPServer() {
+    private func startFTPServer(password: String) {
         guard ftpServer == nil else { return }
-        guard !sftpServerPassword.isEmpty else {
+        guard !password.isEmpty else {
             ftpStartError = "Set the server username and password first (shared with SFTP)."
             return
         }
@@ -352,7 +422,7 @@ final class AppModel: ObservableObject {
         let config = FTPServer.Config(
             port: Self.ftpServerPort,
             username: sftpUsername,
-            password: sftpServerPassword,
+            password: password,
             rootPath: tftpRootPath,
             allowWrites: UserDefaults.standard.bool(forKey: "tftpAllowWrites"))
         let server = FTPServer(
@@ -418,8 +488,14 @@ final class AppModel: ObservableObject {
     // MARK: - SFTP server lifecycle
 
     func setSFTPServer(on: Bool) {
+        sftpStartGeneration += 1
         if on {
-            startSFTPServer()
+            let generation = sftpStartGeneration
+            Task {
+                let password = await serverPassword()
+                guard generation == sftpStartGeneration else { return }
+                startSFTPServer(password: password)
+            }
         } else {
             sftpServer?.stop()
             sftpServer = nil
@@ -429,9 +505,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startSFTPServer() {
+    private func startSFTPServer(password: String) {
         guard sftpServer == nil else { return }
-        guard !sftpServerPassword.isEmpty else {
+        guard !password.isEmpty else {
             sftpStartError = "Set an SFTP username and password first."
             return
         }
@@ -440,7 +516,7 @@ final class AppModel: ObservableObject {
         let config = SFTPServerListener.Config(
             port: Self.sftpServerPort,
             username: sftpUsername,
-            password: sftpServerPassword,
+            password: password,
             rootPath: tftpRootPath,
             allowWrites: UserDefaults.standard.bool(forKey: "tftpAllowWrites"))
         let server = SFTPServerListener(

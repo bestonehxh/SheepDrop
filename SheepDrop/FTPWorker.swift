@@ -20,6 +20,7 @@ nonisolated final class FTPWorker: @unchecked Sendable {
     private let queue = DispatchQueue(label: "sheepdrop.ftp.control")
     private var control: NWConnection?
     private var buffer = Data()          // control-line read buffer (op-confined)
+    private var controlHost = ""         // data connections go here (see withDataConnection)
 
     // MARK: - Async surface
 
@@ -92,8 +93,11 @@ nonisolated final class FTPWorker: @unchecked Sendable {
         buffer.removeAll()          // stale bytes from a previously dropped session
         let connection = try await openConnection(host: config.host, port: config.port)
         control = connection
+        controlHost = config.host
         do {
-            _ = try await readReply()                       // 220 welcome
+            // A server that accepts TCP but never greets must not hold
+            // Connect for the full stall timeout.
+            _ = try await readReply(timeout: Self.connectTimeout)   // 220 welcome
             try await command("USER \(config.username)", expect: [220, 230, 331])
             if let password = config.password {
                 try await command("PASS \(password)", expect: [230, 202])
@@ -201,10 +205,14 @@ nonisolated final class FTPWorker: @unchecked Sendable {
 
     private func withDataConnection<T: Sendable>(_ body: @escaping @Sendable (NWConnection) async throws -> T) async throws -> T {
         let reply = try await command("PASV", expect: [227])
-        guard let (host, port) = Self.parsePASV(reply) else {
+        guard let (_, port) = Self.parsePASV(reply) else {
             throw SFTPError(message: "could not parse passive-mode reply")
         }
-        let data = try await openConnection(host: host, port: port)
+        // Connect to the CONTROL host, not the address in the 227 reply: a
+        // server behind NAT advertises its private IP (unreachable from here),
+        // and a hostile one could point us at a third host. Same default as
+        // curl (--ftp-skip-pasv-ip).
+        let data = try await openConnection(host: controlHost, port: port)
         defer { data.cancel() }
         return try await body(data)
     }
@@ -226,7 +234,7 @@ nonisolated final class FTPWorker: @unchecked Sendable {
     }
 
     /// Reads one full FTP reply (handles multi-line "123-…\n…\n123 end").
-    private func readReply() async throws -> String {
+    private func readReply(timeout: TimeInterval = FTPWorker.stallTimeout) async throws -> String {
         guard let control else { throw SFTPError(message: "not connected") }
         while true {
             if let line = takeLine() {
@@ -237,18 +245,19 @@ nonisolated final class FTPWorker: @unchecked Sendable {
                 // multi-line continuation — keep reading until "NNN " line.
                 if line.count >= 4, line[line.index(line.startIndex, offsetBy: 3)] == "-" {
                     let code = String(line.prefix(3))
-                    return try await readUntilFinal(code: code, first: line)
+                    return try await readUntilFinal(code: code, first: line, timeout: timeout)
                 }
                 continue
             }
-            guard let chunk = try await receive(control), !chunk.isEmpty else {
+            guard let chunk = try await receive(control, timeout: timeout), !chunk.isEmpty else {
                 throw SFTPError(message: "control connection closed")
             }
             buffer.append(chunk)
         }
     }
 
-    private func readUntilFinal(code: String, first: String) async throws -> String {
+    private func readUntilFinal(code: String, first: String,
+                                timeout: TimeInterval) async throws -> String {
         guard let control else { throw SFTPError(message: "not connected") }
         var collected = first
         while true {
@@ -257,7 +266,7 @@ nonisolated final class FTPWorker: @unchecked Sendable {
                 if line.hasPrefix(code + " ") { return collected }
                 continue
             }
-            guard let chunk = try await receive(control), !chunk.isEmpty else {
+            guard let chunk = try await receive(control, timeout: timeout), !chunk.isEmpty else {
                 throw SFTPError(message: "control connection closed")
             }
             buffer.append(chunk)
@@ -284,42 +293,73 @@ nonisolated final class FTPWorker: @unchecked Sendable {
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let resumed = ResumeGuard()
+            // NWConnection never fails a refused/unreachable connect on its
+            // own — it sits in .waiting and retries forever, so Connect spun
+            // indefinitely (and disconnect() queued behind it). Fail on
+            // .waiting, and on a hard deadline.
+            @Sendable func fail(_ error: Error) {
+                if resumed.once() { connection.cancel(); continuation.resume(throwing: error) }
+            }
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     if resumed.once() { continuation.resume() }
-                case .failed(let error):
-                    if resumed.once() { continuation.resume(throwing: error) }
+                case .waiting(let error), .failed(let error):
+                    fail(error)
                 case .cancelled:
-                    if resumed.once() { continuation.resume(throwing: SFTPError(message: "connection cancelled")) }
+                    fail(SFTPError(message: "connection cancelled"))
                 default: break
                 }
             }
             connection.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + Self.connectTimeout) {
+                fail(SFTPError(message: "connection timed out (\(host):\(port))"))
+            }
         }
         return connection
     }
 
+    static let connectTimeout: TimeInterval = 15
+    /// No byte moving for this long = a dead peer. Cancelling the connection
+    /// makes the pending receive/send fail, which unwinds the operation chain.
+    static let stallTimeout: TimeInterval = 60
+
+    /// Cancels `connection` if the operation behind `resumed` hasn't finished
+    /// within the stall timeout.
+    private func armStallTimer(_ connection: NWConnection, _ resumed: ResumeGuard,
+                               after seconds: TimeInterval = FTPWorker.stallTimeout) {
+        queue.asyncAfter(deadline: .now() + seconds) {
+            if !resumed.isDone { connection.cancel() }
+        }
+    }
+
     private func send(_ connection: NWConnection, _ data: Data) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let resumed = ResumeGuard()
             connection.send(content: data, completion: .contentProcessed { error in
+                guard resumed.once() else { return }
                 if let error { continuation.resume(throwing: error) } else { continuation.resume() }
             })
+            armStallTimer(connection, resumed)
         }
     }
 
     /// Returns nil only at real EOF (isComplete). A spurious empty-but-open
     /// read loops internally, so callers can treat nil as "the stream ended"
     /// — a plain `!chunk.isEmpty` check would truncate a listing/transfer.
-    private func receive(_ connection: NWConnection) async throws -> Data? {
+    private func receive(_ connection: NWConnection,
+                         timeout: TimeInterval = FTPWorker.stallTimeout) async throws -> Data? {
         while true {
             let result: Data? = try await withCheckedThrowingContinuation { continuation in
+                let resumed = ResumeGuard()
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 128 * 1024) { data, _, isComplete, error in
+                    guard resumed.once() else { return }
                     if let error { continuation.resume(throwing: error) }
                     else if let data, !data.isEmpty { continuation.resume(returning: data) }
                     else if isComplete { continuation.resume(returning: nil) }
                     else { continuation.resume(returning: Data()) }  // keep waiting
                 }
+                armStallTimer(connection, resumed, after: timeout)
             }
             if let result {
                 if result.isEmpty { continue }   // open but nothing yet
@@ -339,13 +379,18 @@ nonisolated final class FTPWorker: @unchecked Sendable {
         return all
     }
 
+    /// Callbacks and timers for one connection all run on `queue`, but the
+    /// lock keeps this correct regardless.
     private final class ResumeGuard: @unchecked Sendable {
+        private let lock = NSLock()
         private var done = false
         func once() -> Bool {
+            lock.lock(); defer { lock.unlock() }
             if done { return false }
             done = true
             return true
         }
+        var isDone: Bool { lock.lock(); defer { lock.unlock() }; return done }
     }
 
     // MARK: - Parsing

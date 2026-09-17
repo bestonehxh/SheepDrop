@@ -39,7 +39,6 @@ struct TransfersView: View {
                         .foregroundStyle(Theme.dimText)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Theme.content)
             } else {
                 ScrollView {
                     VStack(spacing: 2) {
@@ -53,7 +52,6 @@ struct TransfersView: View {
                     .padding(10)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Theme.content)
             }
 
             HStack {
@@ -64,12 +62,10 @@ struct TransfersView: View {
             }
             .padding(.horizontal, 14)
             .frame(height: 26)
-            .background(Theme.header, ignoresSafeAreaEdges: [])
             .overlay(alignment: .top) {
                 Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
             }
         }
-        .background(Theme.content, ignoresSafeAreaEdges: [])
     }
 
     private var todaySummary: String {

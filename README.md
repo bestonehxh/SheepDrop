@@ -14,7 +14,7 @@ command — no separate TFTP daemon to configure.
 
 ## ⬇️ Download
 
-[![Download SheepDrop for macOS](https://img.shields.io/badge/Download-SheepDrop_1.1_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/SheepDrop/releases/latest)
+[![Download SheepDrop for macOS](https://img.shields.io/badge/Download-SheepDrop_1.2_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/SheepDrop/releases/latest)
 
 **[Get the latest release →](https://github.com/bestonehxh/SheepDrop/releases/latest)** — download the `.zip`, unzip, and drag **SheepDrop.app** into `Applications`.
 

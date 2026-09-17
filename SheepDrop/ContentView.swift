@@ -11,6 +11,10 @@ struct ContentView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            // Same as SheepTerm: a full-height column flush with the window
+            // edge, painted with the behind-window `.sidebar` material. NOT an
+            // inset floating glass panel — its corner radius didn't match the
+            // window's, so the traffic lights poked past the panel's edge.
             SidebarView()
                 .frame(width: 240)
             Rectangle()
@@ -18,7 +22,11 @@ struct ContentView: View {
                 .frame(width: 0.5)
             mainColumn
         }
-        .background(Theme.content, ignoresSafeAreaEdges: [])
+        // See-through glass for the WHOLE window (user asked for a transparent
+        // glass background, 2026-09-17): one behind-window vibrancy layer, and
+        // every main-column view leaves its background clear so the desktop
+        // shows through. Cards/controls on top use SwiftUI glass.
+        .background { VisualEffectBackground(material: .sidebar).ignoresSafeArea() }
         .frame(minWidth: 1060, minHeight: 640)
         .sheet(isPresented: $model.showQuickConnect) {
             QuickConnectSheet()
@@ -60,6 +68,5 @@ struct EmptyPaneView: View {
                 .foregroundStyle(Theme.dimText)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.content, ignoresSafeAreaEdges: [])
     }
 }

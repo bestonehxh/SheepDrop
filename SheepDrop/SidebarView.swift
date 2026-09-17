@@ -5,7 +5,6 @@ import SwiftUI
 /// section (Transfers / Serve), Recent, and an accent New Connection button.
 struct SidebarView: View {
     @ObservedObject private var model = AppModel.shared
-    @State private var renamingGroup: HostGroup?
     @State private var renameText = ""
     @State private var creatingGroup = false
     @State private var newGroupText = ""
@@ -37,7 +36,6 @@ struct SidebarView: View {
             Spacer(minLength: 0)
 
             VStack(spacing: 0) {
-                Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
                 if isServerMode {
                     serverBottomBar
                 } else {
@@ -51,23 +49,22 @@ struct SidebarView: View {
                             Text("New Connection")
                                 .font(.system(size: 12.5, weight: .medium))
                         }
-                        .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 28)
-                        .background(RoundedRectangle(cornerRadius: 7).fill(Theme.accent))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.glassProminent)
+                    .tint(Theme.accent)
+                    .controlSize(.large)
                     Button {
                         newGroupText = ""
                         creatingGroup = true
                     } label: {
                         Image(systemName: "folder.badge.plus")
                             .font(.system(size: 13))
-                            .foregroundStyle(Theme.dimText)
-                            .frame(width: 28, height: 28)
-                            .background(RoundedRectangle(cornerRadius: 7).fill(Theme.control))
+                            .foregroundStyle(Theme.text2)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .controlSize(.large)
                     .help("New group")
                 }
                 .padding(10)
@@ -75,17 +72,20 @@ struct SidebarView: View {
             }
         }
         .frame(maxHeight: .infinity)
-        .background(Theme.sidebar, ignoresSafeAreaEdges: [])
+        // Presented from the outline's group context menu (Rename…).
         .alert("Rename group", isPresented: renameBinding) {
             TextField("Group name", text: $renameText)
-            Button("Cancel", role: .cancel) { renamingGroup = nil }
+            Button("Cancel", role: .cancel) { model.renameGroupRequest = nil }
             Button("Rename") {
-                if let group = renamingGroup {
+                if let id = model.renameGroupRequest {
                     let name = renameText.trimmingCharacters(in: .whitespaces)
-                    if !name.isEmpty { model.renameGroup(group.id, to: name) }
+                    if !name.isEmpty { model.renameGroup(id, to: name) }
                 }
-                renamingGroup = nil
+                model.renameGroupRequest = nil
             }
+        }
+        .onChange(of: model.renameGroupRequest) { _, id in
+            renameText = model.groups.first { $0.id == id }?.name ?? ""
         }
         .alert("New group", isPresented: $creatingGroup) {
             TextField("Group name", text: $newGroupText)
@@ -98,7 +98,8 @@ struct SidebarView: View {
     }
 
     private var renameBinding: Binding<Bool> {
-        Binding(get: { renamingGroup != nil }, set: { if !$0 { renamingGroup = nil } })
+        Binding(get: { model.renameGroupRequest != nil },
+                set: { if !$0 { model.renameGroupRequest = nil } })
     }
 
     // MARK: - Mode-specific sidebar bodies
@@ -111,7 +112,6 @@ struct SidebarView: View {
             // Recent + groups + hosts live in a real NSOutlineView so drag
             // reorder is native (no SwiftUI drop animation / drift).
             SidebarOutline(model: model, recents: model.recents)
-            Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
             ActivityRow(
                 icon: "arrow.left.arrow.right",
                 title: "Transfers",
@@ -173,6 +173,7 @@ struct SidebarView: View {
     }
 
     private var modeSwitch: some View {
+        GlassEffectContainer(spacing: 6) {
         HStack(spacing: 6) {
             modeButton(
                 title: "Connect",
@@ -195,6 +196,8 @@ struct SidebarView: View {
                 model.mainPane = .serve
             }
         }
+        }
+        .animation(.smooth(duration: 0.25), value: isServerMode)
     }
 
     private func modeButton(title: String, subtitle: String, icon: String,
@@ -214,7 +217,9 @@ struct SidebarView: View {
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 8).fill(active ? Theme.accent : Theme.control))
+            .contentShape(.rect(cornerRadius: 12))
+            .glassEffect(active ? .regular.tint(Theme.accent).interactive() : .regular.interactive(),
+                         in: .rect(cornerRadius: 12))
         }
         .buttonStyle(.plain)
     }
@@ -267,7 +272,7 @@ struct ActivityRow: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .background(
-            RoundedRectangle(cornerRadius: 7)
+            RoundedRectangle(cornerRadius: 9)
                 .fill(isSelected ? Theme.selectedRow : hovering ? Theme.hover : .clear)
         )
         .contentShape(Rectangle())

@@ -60,6 +60,7 @@ final class SFTPSession: ObservableObject {
     }
 
     private var hasStarted = false
+    private var connectInFlight = false
 
     init(host: HostEntry) {
         self.host = host
@@ -73,8 +74,15 @@ final class SFTPSession: ObservableObject {
         self.tab = tab
     }
 
+    /// The corrected username must reach the tab and the saved host too:
+    /// "Remember" stores the password under the NEW user@host, so a saved host
+    /// still carrying the old one missed the Keychain on every launch (and the
+    /// tab title / reuse match kept the stale user).
     func updateUsername(_ username: String) {
+        guard username != host.username else { return }
         host.username = username
+        tab?.setUsername(username)
+        AppModel.shared.updateUsername(hostID: host.id, to: username)
     }
 
     /// Cancel from the password sheet. Closes the sheet; if the session never
@@ -103,10 +111,18 @@ final class SFTPSession: ObservableObject {
             } else {
                 // Keychain read off the main thread — SecItemCopyMatching is an
                 // IPC round-trip and the call that blocks on the SecurityAgent
-                // prompt when a re-signed binary reads an old item.
+                // prompt when a re-signed binary reads an old item. Show
+                // "Connecting…" meanwhile, so the pane's Connect button isn't
+                // offered for a second, parallel attempt.
                 let account = Keychain.account(for: host)
-                if let stored = await Task.detached(operation: { Keychain.password(account: account) }).value {
+                connectInFlight = true
+                tab?.status = .connecting
+                let stored = await Task.detached(operation: { Keychain.password(account: account) }).value
+                connectInFlight = false
+                if let stored {
                     connect(password: stored, remember: false)
+                } else if case .connecting? = tab?.status {
+                    tab?.status = .disconnected
                 }
             }
             // else: stay disconnected; the pane's Connect button prompts.
@@ -116,6 +132,7 @@ final class SFTPSession: ObservableObject {
     /// Explicit user request to connect (Connect button / retry) — this is
     /// where the password sheet comes from.
     func beginInteractiveConnect() {
+        guard !connectInFlight else { return }
         let account = Keychain.account(for: host)
         Task { @MainActor in
             if let stored = await Task.detached(operation: { Keychain.password(account: account) }).value {
@@ -144,6 +161,10 @@ final class SFTPSession: ObservableObject {
     /// error) and only closes itself on success — dismiss-then-represent on
     /// failure raced the dismissal animation and desynced the sheet state.
     func connect(password: String?, remember: Bool) {
+        // One attempt at a time — a second connect racing the first opened two
+        // libssh sessions on the same worker.
+        guard !connectInFlight else { return }
+        connectInFlight = true
         tab?.status = .connecting
         isLoading = true
         authError = nil
@@ -151,6 +172,7 @@ final class SFTPSession: ObservableObject {
                                 username: host.username, password: password,
                                 knownHostsPath: Self.devArgument("-demoKnownHosts"))
         Task {
+            defer { connectInFlight = false }
             do {
                 var hostKeyNotice: String?
                 if isFTP {
@@ -240,12 +262,14 @@ final class SFTPSession: ObservableObject {
         let trimmed = rawPath.trimmingCharacters(in: .whitespaces)
         Task {
             let target: String
-            if trimmed.isEmpty || trimmed == "~" {
+            if trimmed.isEmpty || trimmed == "~" || trimmed.hasPrefix("~/") {
                 // Home is protocol-specific — the SFTP worker isn't connected on
                 // an FTP session, so ask the FTP control channel there.
-                target = isFTP
+                let home = isFTP
                     ? ((try? await ftp.currentDirectory()) ?? "/")
                     : ((try? await worker.homeDirectory()) ?? "/")
+                // "~/x" is home + x (it used to become "<cwd>/~/x").
+                target = trimmed.hasPrefix("~/") ? joined(home, String(trimmed.dropFirst(2))) : home
             } else if trimmed.hasPrefix("/") {
                 target = trimmed
             } else {
@@ -255,7 +279,23 @@ final class SFTPSession: ObservableObject {
         }
     }
 
+    /// Collapses "//", "." and ".." in an absolute remote path. Typed paths
+    /// were stored verbatim: "/a/b/.." then made ↑ go back INTO /a/b, and a
+    /// trailing slash produced "/configs//x" on the next folder entered.
+    /// Non-absolute device paths ("flash:/…") are left untouched.
+    static func normalize(_ path: String) -> String {
+        guard path.hasPrefix("/") else { return path }
+        var parts: [Substring] = []
+        for part in path.split(separator: "/", omittingEmptySubsequences: true) {
+            if part == "." { continue }
+            if part == ".." { _ = parts.popLast(); continue }
+            parts.append(part)
+        }
+        return "/" + parts.joined(separator: "/")
+    }
+
     private func load(_ newPath: String) async {
+        let newPath = Self.normalize(newPath)
         isLoading = true
         do {
             let listing = isFTP
@@ -478,7 +518,8 @@ final class SFTPSession: ObservableObject {
     /// file or a permission denial, where the connection is still good.
     private func isConnectionLost(_ error: Error) -> Bool {
         let dead: [POSIXErrorCode] = [.ENOTCONN, .ECONNRESET, .EPIPE,
-                                      .ETIMEDOUT, .ECONNABORTED, .ENETDOWN, .ENETRESET]
+                                      .ETIMEDOUT, .ECONNABORTED, .ENETDOWN, .ENETRESET,
+                                      .ECANCELED]   // FTPWorker's stall timer cancels a dead link
         if let nw = error as? NWError, case let .posix(code) = nw {
             return dead.contains(code)
         }
