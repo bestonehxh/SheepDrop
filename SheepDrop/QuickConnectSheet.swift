@@ -2,7 +2,8 @@ import SwiftUI
 
 /// ⌘T sheet: protocol, address, credentials, optional name, and where to
 /// save it — an existing group, a new group, or nowhere. Passwords are
-/// collected on connect (Keychain), not here.
+/// collected on connect (Keychain), not here. Quiet form: underline fields,
+/// word tabs for the protocol, one ink button.
 struct QuickConnectSheet: View {
     @ObservedObject private var model = AppModel.shared
     @Environment(\.dismiss) private var dismiss
@@ -27,64 +28,76 @@ struct QuickConnectSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("New Connection")
-                .font(.system(size: 15, weight: .medium))
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Add Device")
+                .font(Theme.pageTitle)
+                .accessibilityAddTraits(.isHeader)
+                .foregroundStyle(Theme.ink)
 
-            Picker("Protocol", selection: $proto) {
-                ForEach(TransferProtocolKind.allCases) { kind in
-                    Text(kind.label).tag(kind)
+            QuietTabs(items: TransferProtocolKind.allCases.map { ($0, $0.label) },
+                      selection: $proto)
+
+            VStack(alignment: .leading, spacing: 14) {
+                QuietFieldLabel(label: "Host or IP address") {
+                    TextField("10.0.0.1", text: $address)
+                        .textFieldStyle(.quiet)
+                }
+                HStack(alignment: .top, spacing: 20) {
+                    QuietFieldLabel(label: "Username") {
+                        TextField("admin", text: $username)
+                            .textFieldStyle(.quiet)
+                            .disabled(proto == .tftp)
+                            .opacity(proto == .tftp ? 0.4 : 1)
+                    }
+                    QuietFieldLabel(label: "Port") {
+                        TextField("\(proto.defaultPort)", text: $portText)
+                            .textFieldStyle(.quiet)
+                            .frame(width: 90)
+                    }
+                    Spacer()
+                }
+                QuietFieldLabel(label: "Name (optional)") {
+                    TextField("BBL Core SW", text: $name)
+                        .textFieldStyle(.quiet)
+                }
+                HStack(alignment: .top, spacing: 20) {
+                    QuietFieldLabel(label: "Save to") {
+                        Picker("", selection: $saveTarget) {
+                            Text("Don't save").tag(Self.noneTag)
+                            ForEach(model.groups) { group in
+                                Text(group.name).tag(group.id.uuidString)
+                            }
+                            Divider()
+                            Text("New group…").tag(Self.newGroupTag)
+                        }
+                        .labelsHidden()
+                        .frame(width: 200)
+                    }
+                    if saveTarget == Self.newGroupTag {
+                        QuietFieldLabel(label: "Group name") {
+                            TextField("Aruba Lab", text: $newGroupName)
+                                .textFieldStyle(.quiet)
+                        }
+                    }
+                    Spacer()
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            TextField("Host or IP address", text: $address)
-                .textFieldStyle(.roundedBorder)
 
             HStack(spacing: 10) {
-                TextField("Username", text: $username)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(proto == .tftp)
-                    .opacity(proto == .tftp ? 0.4 : 1)
-                TextField("Port \(proto.defaultPort)", text: $portText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 90)
-            }
-
-            TextField("Name (optional)", text: $name)
-                .textFieldStyle(.roundedBorder)
-
-            HStack(spacing: 8) {
-                Text("Save to")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $saveTarget) {
-                    Text("Don't save").tag(Self.noneTag)
-                    ForEach(model.groups) { group in
-                        Text(group.name).tag(group.id.uuidString)
-                    }
-                    Divider()
-                    Text("New group…").tag(Self.newGroupTag)
-                }
-                .labelsHidden()
-                if saveTarget == Self.newGroupTag {
-                    TextField("Group name", text: $newGroupName)
-                        .textFieldStyle(.roundedBorder)
-                }
-            }
-
-            HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
+                    .buttonStyle(.quietBordered)
                     .keyboardShortcut(.cancelAction)
                 Button("Connect") { connect() }
+                    .buttonStyle(.quietPrimary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+            .padding(.top, 6)
         }
-        .padding(20)
-        .frame(width: 400)
+        .padding(24)
+        .frame(width: 440)
+        .background(Theme.background)
     }
 
     private func connect() {

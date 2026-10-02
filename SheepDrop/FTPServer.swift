@@ -94,6 +94,15 @@ nonisolated final class FTPServer: @unchecked Sendable {
                 candidate.newConnectionHandler = { connection in
                     self.queue.async {
                         let session = Session(server: self, control: connection)
+                        // Caps: every session is a control connection plus
+                        // data listeners; unbounded, any LAN host could pile
+                        // them up (audit 2026-10-02).
+                        let host = session.peerHost
+                        guard self.sessions.count < Self.maximumSessions,
+                              self.sessions.values.filter({ $0.peerHost == host }).count < Self.maximumPerPeer else {
+                            connection.cancel()
+                            return
+                        }
                         self.sessions[ObjectIdentifier(session)] = session   // retain
                         session.begin()
                     }
@@ -108,6 +117,9 @@ nonisolated final class FTPServer: @unchecked Sendable {
     private final class Box<T>: @unchecked Sendable {
         var value: T; init(_ v: T) { value = v }
     }
+
+    private static let maximumSessions = 16
+    private static let maximumPerPeer = 4
 
     fileprivate var conf: Config { config }
     fileprivate var writesAllowed: Bool { allowWritesNow() }
@@ -124,7 +136,8 @@ nonisolated final class FTPServer: @unchecked Sendable {
         let candidate = rootURL.appendingPathComponent(trimmed).standardizedFileURL
         let base = rootURL.standardizedFileURL.path
         let basePrefix = base.hasSuffix("/") ? base : base + "/"
-        return candidate.path == base || candidate.path.hasPrefix(basePrefix) ? candidate : nil
+        guard candidate.path == base || candidate.path.hasPrefix(basePrefix) else { return nil }
+        return ServedPath.confined(candidate, to: rootURL)      // symlinks too
     }
 
     fileprivate func isRoot(_ url: URL) -> Bool {
@@ -150,6 +163,17 @@ nonisolated final class FTPServer: @unchecked Sendable {
         private var pasvListener: NWListener?
         private var pendingData: NWConnection?
         private var portTarget: (host: String, port: UInt16)?
+
+        /// Wrong passwords on one connection before it is dropped (the SSH
+        /// server allows the same 3). Brute force was unlimited before.
+        private static let maximumAuthFailures = 3
+        /// A command line longer than this without a newline is garbage.
+        private static let maximumLine = 4096
+        private var authFailures = 0
+        /// Set by hangUp: no further command may run, even ones already in
+        /// the buffer — pipelined "PASS guess" lines in one segment otherwise
+        /// kept being tried after the 3rd failure (and a hit logged in).
+        private var closing = false
 
         init(server: FTPServer, control: NWConnection) {
             self.server = server
@@ -178,7 +202,12 @@ nonisolated final class FTPServer: @unchecked Sendable {
                 guard let self else { return }
                 if let data, !data.isEmpty {
                     buffer.append(data)
-                    while let line = takeLine() { handle(line) }
+                    while !closing, let line = takeLine() { handle(line) }
+                    if closing { buffer.removeAll(); return }
+                    if buffer.count > Self.maximumLine {
+                        hangUp("500 Line too long\r\n")
+                        return
+                    }
                 }
                 if isComplete || error != nil {
                     control.cancel()
@@ -195,6 +224,15 @@ nonisolated final class FTPServer: @unchecked Sendable {
             let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
             buffer.removeSubrange(buffer.startIndex..<range.upperBound)
             return String(decoding: lineData, as: UTF8.self).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+        }
+
+        /// Sends a final reply, closes once it is out (cancel() right after
+        /// send() drops it — see QUIT), and releases the session.
+        private func hangUp(_ text: String) {
+            closing = true
+            control.send(content: Data(text.utf8),
+                         completion: .contentProcessed { [weak self] _ in self?.close() })
+            server?.sessionEnded(self)
         }
 
         private func send(_ text: String) {
@@ -214,12 +252,20 @@ nonisolated final class FTPServer: @unchecked Sendable {
                 authedUser = arg
                 send("331 Password required\r\n")
             case "PASS":
-                if authedUser == server.conf.username && arg == server.conf.password && !arg.isEmpty {
+                // Both compares always run, in constant time per length.
+                let userOK = ftpConstantTimeEqual(authedUser ?? "", server.conf.username)
+                let passOK = ftpConstantTimeEqual(arg, server.conf.password)
+                if userOK && passOK && !arg.isEmpty {
                     loggedIn = true
                     send("230 Logged in\r\n")
                 } else {
                     server.log(TFTPLogEntry(time: Date(), peer: peer, isWrite: false,
                                             filename: "(auth)", detail: "FTP · login failed", failed: true))
+                    authFailures += 1
+                    if authFailures >= Self.maximumAuthFailures {
+                        hangUp("421 Too many failed logins\r\n")
+                        return
+                    }
                     send("530 Login incorrect\r\n")
                 }
             case _ where !loggedIn:
@@ -377,7 +423,7 @@ nonisolated final class FTPServer: @unchecked Sendable {
             }
         }
 
-        private var peerHost: String {
+        var peerHost: String {
             if case let .hostPort(host, _) = control.endpoint { return "\(host)" }
             return "127.0.0.1"
         }
@@ -594,4 +640,14 @@ nonisolated final class FTPServer: @unchecked Sendable {
             send("257 Directory created\r\n")
         }
     }
+}
+
+/// Equality whose time depends only on the lengths (String == stops at the
+/// first differing character, which leaks how much of a password was right).
+nonisolated private func ftpConstantTimeEqual(_ a: String, _ b: String) -> Bool {
+    let x = Array(a.utf8), y = Array(b.utf8)
+    guard x.count == y.count else { return false }
+    var diff: UInt8 = 0
+    for i in 0..<x.count { diff |= x[i] ^ y[i] }
+    return diff == 0
 }

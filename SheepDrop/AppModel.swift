@@ -8,8 +8,8 @@ import SwiftUI
 final class AppModel: ObservableObject {
     static let shared = AppModel()
 
-    /// What the main column shows: a connection, the Transfers screen, or
-    /// the Serve screen (design v2 sidebar Activity section).
+    /// What the main column shows: the Connections page (host library or one
+    /// open session), the Transfers screen, or the Serve screen.
     enum MainPane: Equatable {
         case connection
         case transfers
@@ -19,18 +19,26 @@ final class AppModel: ObservableObject {
     @Published var tabs: [SessionTab] = []
     @Published var selectedTabID: UUID?
     @Published var mainPane: MainPane = .connection
-    @Published var drawerOpen = false
     @Published var transferHistory: [TransferRecord] = []
+
+    /// The sidebar's "Client" tab and ⌘1: back to the client side WITHOUT
+    /// leaving the open session — coming back from Activity used to clear
+    /// `selectedTabID`, so the session took a second click (or was
+    /// unreachable once its host fell out of Recent).
+    func showClient() {
+        mainPane = .connection
+    }
 
     /// Re-render views that observe AppModel (Transfers drawer, sidebar badge)
     /// when a session's live transfer state changes. See SFTPSession.transfer.
     func transfersDidChange() { objectWillChange.send() }
 
     func recordTransfer(name: String, detail: String, isUpload: Bool,
-                        bytes: Int64, failed: Bool) {
+                        bytes: Int64, failed: Bool, cancelled: Bool = false) {
         transferHistory.insert(
             TransferRecord(name: name, detail: detail, isUpload: isUpload,
-                           finished: Date(), failed: failed, bytes: bytes),
+                           finished: Date(), failed: failed && !cancelled, bytes: bytes,
+                           cancelled: cancelled),
             at: 0)
         if transferHistory.count > 100 {
             transferHistory.removeLast(transferHistory.count - 100)
@@ -42,11 +50,13 @@ final class AppModel: ObservableObject {
     @Published var groups: [HostGroup]
     @Published var recents: [HostEntry]
     @Published var showQuickConnect = false
-    /// Group whose Rename alert should show (set by the sidebar context menu).
+    /// Group whose Rename alert should show (set by the host list context menu).
     @Published var renameGroupRequest: UUID?
     /// Preselects a group in the QuickConnect sheet (from a group's
-    /// "New Host in …" menu). Consumed and cleared by the sheet.
+    /// "Add Device to …" menu). Consumed and cleared by the sheet.
     var pendingGroupID: UUID?
+    /// Shows the Connections page's New-group alert (page action button).
+    @Published var pendingNewGroup = false
 
     // TFTP server is global app state, not tied to any tab.
     @Published var tftpServerRunning = false
@@ -86,9 +96,9 @@ final class AppModel: ObservableObject {
     private static var devServerPassword: String? {
         // Dev hook: bypass the Keychain (a CLI-injected item triggers a
         // blocking access prompt during launch).
-        guard let index = CommandLine.arguments.firstIndex(of: "-demoSFTPPassword"),
-              CommandLine.arguments.indices.contains(index + 1) else { return nil }
-        return CommandLine.arguments[index + 1]
+        guard let index = DevHooks.arguments.firstIndex(of: "-demoSFTPPassword"),
+              DevHooks.arguments.indices.contains(index + 1) else { return nil }
+        return DevHooks.arguments[index + 1]
     }
 
     /// For rendering only: never touches the Keychain on the main thread (the
@@ -144,13 +154,31 @@ final class AppModel: ObservableObject {
     private init() {
         groups = hostStore.loadGroups()
         recents = hostStore.loadRecents()
+        // Dev hook: `-demoHosts` replaces the saved library with in-memory
+        // sample hosts so UI states can be captured on a clean machine.
+        // Never persisted; no effect in normal launches.
+        if DevHooks.arguments.contains("-demoHosts") {
+            var bbl = HostGroup(name: "BBL DC")
+            var aruba = HostGroup(name: "Aruba Lab")
+            bbl.hosts = [
+                HostEntry(name: "Core SW", address: "10.25.10.1", username: "admin", proto: .sftp),
+                HostEntry(name: "Edge FW", address: "10.25.10.2", username: "admin", proto: .scp),
+            ]
+            aruba.hosts = [
+                HostEntry(name: "CX 6300M", address: "10.44.1.10", username: "manager", proto: .sftp),
+                HostEntry(name: "AP-Controller", address: "10.44.1.20", username: "admin", proto: .ftp),
+                HostEntry(address: "10.44.1.30", port: 69, proto: .tftp),
+            ]
+            groups = [bbl, aruba]
+            recents = [HostEntry(address: "192.168.1.1", username: "admin", proto: .sftp)]
+        }
         // Dev hook: `open SheepDrop.app --args -demoTabs [tftp]` opens a tab
         // per protocol at launch so UI states can be captured without driving
         // the app. No effect in normal launches.
-        if CommandLine.arguments.contains("-demoTabs") {
+        if DevHooks.arguments.contains("-demoTabs") {
             let all = groups.flatMap(\.hosts)
             let wanted: TransferProtocolKind =
-                CommandLine.arguments.contains("tftp") ? .tftp
+                DevHooks.arguments.contains("tftp") ? .tftp
                 : CommandLine.arguments.contains("scp") ? .scp : .sftp
             for kind in TransferProtocolKind.allCases {
                 if let host = all.first(where: { $0.proto == kind }) {
@@ -162,18 +190,18 @@ final class AppModel: ObservableObject {
             }
         }
         // Dev hooks (value required — balanced-pairs rule in CLAUDE.md).
-        if CommandLine.arguments.contains("-demoTFTPServer") {
+        if DevHooks.arguments.contains("-demoTFTPServer") {
             setTFTPServer(on: true)
         }
-        if CommandLine.arguments.contains("-demoSFTPServer") {
+        if DevHooks.arguments.contains("-demoSFTPServer") {
             setSFTPServer(on: true)
         }
-        if CommandLine.arguments.contains("-demoFTPServer") {
+        if DevHooks.arguments.contains("-demoFTPServer") {
             setFTPServer(on: true)
         }
-        if let index = CommandLine.arguments.firstIndex(of: "-demoPane"),
-           CommandLine.arguments.indices.contains(index + 1) {
-            switch CommandLine.arguments[index + 1] {
+        if let index = DevHooks.arguments.firstIndex(of: "-demoPane"),
+           DevHooks.arguments.indices.contains(index + 1) {
+            switch DevHooks.arguments[index + 1] {
             case "serve": mainPane = .serve
             case "transfers": mainPane = .transfers
             default: break

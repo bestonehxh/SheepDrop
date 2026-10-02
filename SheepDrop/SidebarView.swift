@@ -1,78 +1,33 @@
 import SwiftUI
 
-/// Design v2 sidebar: traffic-light row on top, then host groups
-/// (protocol-colored dot + name + address + protocol badge), the Activity
-/// section (Transfers / Serve), Recent, and an accent New Connection button.
+/// The sidebar with the app's two halves: **Client** (reach out to devices —
+/// open sessions, the host library, activity) and **Server** (let devices
+/// pull files from this Mac — the three listeners and this Mac's address).
+/// One segmented switch at the top, like the original design v2 split.
 struct SidebarView: View {
     @ObservedObject private var model = AppModel.shared
     @State private var renameText = ""
-    @State private var creatingGroup = false
     @State private var newGroupText = ""
 
     var body: some View {
         VStack(spacing: 0) {
             // Traffic-light row (the sidebar owns the titlebar area).
-            HStack {
-                Spacer()
-            }
-            .frame(height: model.isFullScreen ? 12 : 52)
+            HStack { Spacer() }
+                .frame(height: model.isFullScreen ? 12 : 44)
 
-            // The one concept the whole app hinges on: are we the client
-            // (reach out to a device) or the server (a device reaches in)?
-            // Two equal buttons make the direction unmistakable.
-            modeSwitch
-                .padding(.horizontal, 10)
-                .padding(.bottom, 8)
+            tabs
+                .padding(.horizontal, 14)
+                .padding(.bottom, 4)
 
-            // The sidebar body belongs to whichever mode is active: the host
-            // library in Connect, a short server summary in Serve. This is why
-            // "New Connection" (a client action) no longer shows in Serve.
-            if isServerMode {
-                serverSidebar
+            if isServer {
+                ServerSidebarBody()
             } else {
-                connectSidebar
-            }
-
-            Spacer(minLength: 0)
-
-            VStack(spacing: 0) {
-                if isServerMode {
-                    serverBottomBar
-                } else {
-                HStack(spacing: 8) {
-                    Button {
-                        model.showQuickConnect = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 11, weight: .bold))
-                            Text("New Connection")
-                                .font(.system(size: 12.5, weight: .medium))
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(Theme.accent)
-                    .controlSize(.large)
-                    Button {
-                        newGroupText = ""
-                        creatingGroup = true
-                    } label: {
-                        Image(systemName: "folder.badge.plus")
-                            .font(.system(size: 13))
-                            .foregroundStyle(Theme.text2)
-                    }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.large)
-                    .help("New group")
-                }
-                .padding(10)
-                }
+                clientBody
             }
         }
         .frame(maxHeight: .infinity)
-        // Presented from the outline's group context menu (Rename…).
+        .background(Theme.sidebar.ignoresSafeArea())
+        // Outline-driven alerts (Rename group / New group).
         .alert("Rename group", isPresented: renameBinding) {
             TextField("Group name", text: $renameText)
             Button("Cancel", role: .cancel) { model.renameGroupRequest = nil }
@@ -87,7 +42,7 @@ struct SidebarView: View {
         .onChange(of: model.renameGroupRequest) { _, id in
             renameText = model.groups.first { $0.id == id }?.name ?? ""
         }
-        .alert("New group", isPresented: $creatingGroup) {
+        .alert("New group", isPresented: $model.pendingNewGroup) {
             TextField("Group name", text: $newGroupText)
             Button("Cancel", role: .cancel) {}
             Button("Create") {
@@ -102,200 +57,175 @@ struct SidebarView: View {
                 set: { if !$0 { model.renameGroupRequest = nil } })
     }
 
-    // MARK: - Mode-specific sidebar bodies
+    // MARK: - Tabs
 
-    private var isServerMode: Bool { model.mainPane == .serve }
+    private var isServer: Bool { model.mainPane == .serve }
 
-    /// Client mode: the saved-host library + Transfers.
-    private var connectSidebar: some View {
-        VStack(spacing: 0) {
-            // Recent + groups + hosts live in a real NSOutlineView so drag
-            // reorder is native (no SwiftUI drop animation / drift).
-            SidebarOutline(model: model, recents: model.recents)
-            ActivityRow(
-                icon: "arrow.left.arrow.right",
-                title: "Transfers",
-                isSelected: model.mainPane == .transfers,
-                trailing: { AnyView(TransfersBadge()) }
-            ) {
-                model.mainPane = .transfers
+    private var tabs: some View {
+        HStack(spacing: 2) {
+            // "Client" returns to the open session (if any) — it no longer
+            // clears the selected tab (one click back from Activity).
+            SegmentButton(title: "Client", selected: !isServer) {
+                model.showClient()
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-        }
-    }
-
-    /// Server mode: no host list (irrelevant when a device connects in) — a
-    /// compact status of the two servers instead.
-    private var serverSidebar: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            sectionHeader("Servers")
-            serverStatusRow(name: "TFTP", running: model.tftpServerRunning,
-                            detail: model.tftpServerRunning ? "port \(model.tftpActualPort.map(String.init) ?? "69")" : "off")
-            serverStatusRow(name: "SFTP / SCP", running: model.sftpServerRunning,
-                            detail: model.sftpServerRunning ? "port \(model.sftpActualPort.map(String.init) ?? "22")" : "off")
-            serverStatusRow(name: "FTP", running: model.ftpServerRunning,
-                            detail: model.ftpServerRunning ? "port \(model.ftpActualPort.map(String.init) ?? "21")" : "off")
-            Text("Configure and toggle each server in the panel on the right.")
-                .font(.system(size: 11))
-                .foregroundStyle(Theme.faintText)
-                .padding(.horizontal, 10)
-                .padding(.top, 8)
-        }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func serverStatusRow(name: String, running: Bool, detail: String) -> some View {
-        HStack(spacing: 9) {
-            Circle()
-                .fill(running ? Theme.ok : Theme.faintText)
-                .frame(width: 7, height: 7)
-            Text(name)
-                .font(.system(size: 13, weight: running ? .semibold : .regular))
-                .foregroundStyle(Theme.text)
-            Spacer(minLength: 0)
-            Text(detail)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(running ? Theme.ok : Theme.faintText)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-    }
-
-    private var serverBottomBar: some View {
-        Text("SheepDrop is serving files to devices that connect in.")
-            .font(.system(size: 11))
-            .foregroundStyle(Theme.faintText)
-            .multilineTextAlignment(.leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(10)
-    }
-
-    private var modeSwitch: some View {
-        GlassEffectContainer(spacing: 6) {
-        HStack(spacing: 6) {
-            modeButton(
-                title: "Connect",
-                subtitle: "reach a device",
-                icon: "arrow.up.right",
-                active: !isServerMode
-            ) {
-                // Always return to the file view — not only from Serve. The
-                // Transfers pane also counts as "Connect" (the button stays
-                // highlighted there), so without this an open Transfers view
-                // had no one-click way back to the connection.
-                model.mainPane = .connection
-            }
-            modeButton(
-                title: "Serve",
-                subtitle: "device reaches in",
-                icon: "square.and.arrow.down",
-                active: isServerMode
-            ) {
+            SegmentButton(title: "Server", selected: isServer) {
                 model.mainPane = .serve
             }
         }
-        }
-        .animation(.smooth(duration: 0.25), value: isServerMode)
+        .padding(2)
+        .background(Theme.track, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 
-    private func modeButton(title: String, subtitle: String, icon: String,
-                            active: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 2) {
-                HStack(spacing: 5) {
-                    Image(systemName: icon)
-                        .font(.system(size: 11, weight: .semibold))
-                    Text(title)
-                        .font(.system(size: 12.5, weight: .semibold))
+    // MARK: - Client body (host library + activity)
+
+    private var clientBody: some View {
+        VStack(spacing: 0) {
+            SidebarOutline(model: model, recents: model.recents)
+
+            activityRow
+                .padding(.horizontal, 8)
+                .padding(.top, 6)
+
+            HStack(spacing: 8) {
+                Button {
+                    model.pendingNewGroup = true
+                } label: {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 15))
                 }
-                .foregroundStyle(active ? .white : Theme.text2)
-                Text(subtitle)
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(active ? Color.white.opacity(0.85) : Theme.faintText)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 7)
-            .contentShape(.rect(cornerRadius: 12))
-            .glassEffect(active ? .regular.tint(Theme.accent).interactive() : .regular.interactive(),
-                         in: .rect(cornerRadius: 12))
-        }
-        .buttonStyle(.plain)
-    }
+                .buttonStyle(QuietIconStyle(size: 36))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Theme.control, lineWidth: 1))
+                .help("New Group")
+                .accessibilityLabel("New group")
 
-    // Group headers, host rows, and their drag/drop now live in
-    // SidebarOutline (a real NSOutlineView) — the SwiftUI versions were
-    // removed with the outline swap. `sectionHeader` stays: the mode switch's
-    // "Servers" list and the outline's own labels reuse the look.
-    private func sectionHeader(_ name: String) -> some View {
-        Text(name.uppercased())
-            .font(.system(size: 11, weight: .semibold))
-            .kerning(0.3)
-            .foregroundStyle(Theme.faintText)
-            .padding(.horizontal, 10)
-            .padding(.top, 12)
-            .padding(.bottom, 4)
-    }
-}
-
-
-struct ActivityRow: View {
-    let icon: String
-    let title: String
-    var subtitle: String?
-    var isSelected = false
-    var trailing: () -> AnyView = { AnyView(EmptyView()) }
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        HStack(spacing: 9) {
-            Image(systemName: icon)
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.dimText)
-                .frame(width: 16)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(title)
-                    .font(.system(size: 13))
-                    .foregroundStyle(Theme.text2)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.faintText)
-                        .lineLimit(1)
+                Button {
+                    model.showQuickConnect = true
+                } label: {
+                    Text("Add Device…")
                 }
+                .buttonStyle(QuietPrimaryStyle(height: 36, fullWidth: true, size: 14))
+                .help("Add a device and connect (⌘T)")
             }
-            Spacer(minLength: 0)
-            trailing()
+            .padding(EdgeInsets(top: 12, leading: 14, bottom: 16, trailing: 14))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 9)
-                .fill(isSelected ? Theme.selectedRow : hovering ? Theme.hover : .clear)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture(perform: action)
-        .onHover { hovering = $0 }
     }
-}
 
-struct TransfersBadge: View {
-    @ObservedObject private var model = AppModel.shared
-
-    private var activeCount: Int {
+    private var activeTransfers: Int {
         model.tabs.compactMap(\.sftp).filter { $0.transfer != nil }.count
     }
 
-    var body: some View {
-        if activeCount > 0 {
-            Text("\(activeCount)")
-                .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .background(Capsule().fill(Theme.accent))
+    private var activityRow: some View {
+        let selected = model.mainPane == .transfers
+        return Button {
+            model.mainPane = .transfers
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 16)
+                Text("Activity")
+                    .font(.system(size: 14, weight: selected ? .semibold : .regular))
+                Spacer(minLength: 0)
+                if activeTransfers > 0 {
+                    Text("\(activeTransfers)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.background)
+                        .padding(.horizontal, 6)
+                        .frame(minWidth: 20, minHeight: 20)
+                        .background(Theme.ink, in: Capsule())
+                        .accessibilityLabel("\(activeTransfers) active")
+                }
+            }
+            .foregroundStyle(Theme.ink)
+            .padding(.horizontal, 8)
+            .frame(height: 36)
+            .background {
+                if selected {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.sidebarSelection)
+                }
+            }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .help("Transfers in progress and history (⌘2)")
+    }
+}
+
+// MARK: - Server body (the listeners + this Mac's address)
+
+private struct ServerSidebarBody: View {
+    @ObservedObject private var model = AppModel.shared
+    /// Shared with ServeView: which listener the Server page shows.
+    @AppStorage("serveTransport") private var serveTransport = "tftp"
+    /// getifaddrs is a syscall — resolve once, not per render.
+    @State private var macIP = LocalNetwork.primaryIPv4() ?? "No network"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            GroupLabel(text: "Listeners")
+                .padding(EdgeInsets(top: 18, leading: 16, bottom: 6, trailing: 16))
+            listenerRow(raw: "tftp", name: "TFTP", running: model.tftpServerRunning,
+                        port: model.tftpActualPort.map(Int.init))
+            listenerRow(raw: "ssh", name: "SFTP / SCP", running: model.sftpServerRunning,
+                        port: model.sftpActualPort.map(Int.init))
+            listenerRow(raw: "ftp", name: "FTP", running: model.ftpServerRunning,
+                        port: model.ftpActualPort.map(Int.init))
+
+            Spacer(minLength: 12)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("This Mac on the network:")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Theme.muted)
+                Text(macIP)
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Theme.ink)
+                    .textSelection(.enabled)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.track, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .padding(EdgeInsets(top: 0, leading: 14, bottom: 16, trailing: 14))
+            .accessibilityElement(children: .combine)
+        }
+        .onAppear { macIP = LocalNetwork.primaryIPv4() ?? "No network" }
+    }
+
+    private func listenerRow(raw: String, name: String, running: Bool, port: Int?) -> some View {
+        let selected = serveTransport == raw
+        let state = running ? "Listening · port \(port.map(String.init) ?? "…")" : "Off"
+        return Button {
+            serveTransport = raw
+            model.mainPane = .serve
+        } label: {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(running ? Theme.ok : Theme.control)
+                    .frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name)
+                        .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(Theme.ink)
+                    Text(state)
+                        .font(Theme.small)
+                        .foregroundStyle(running ? Theme.ok : Theme.muted)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 44)
+            .background {
+                if selected {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.sidebarSelection)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 8)
+        .accessibilityLabel("\(name), \(state)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

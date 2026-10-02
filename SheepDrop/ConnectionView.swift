@@ -2,10 +2,12 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// One connection in the main column (design v2): 52pt toolbar with
-/// breadcrumb + search + queue button, the local/remote dual pane (remote is
-/// the blind put/get form for SCP and TFTP), the collapsible transfers
-/// drawer, and the security status bar.
+/// One open session, as a page: ONE 64 pt header bar (back, host name +
+/// status pill, `user@address · PROTO`, Disconnect / close), then the two
+/// panes with the Upload / Download buttons between them (the remote side is
+/// the blind put/get form for SCP-without-SFTP and TFTP), and a live transfer
+/// row only while one runs. Quiet look: no cards, no footer — the status
+/// lives in the header.
 struct ConnectionView: View {
     @ObservedObject var tab: SessionTab
     @ObservedObject private var model = AppModel.shared
@@ -13,20 +15,17 @@ struct ConnectionView: View {
     /// switch / Transfers / Serve visit, so the local folder snapped back to
     /// ~ and a download landed somewhere other than the folder on screen.
     private var localPane: LocalPaneModel { tab.localPane }
-    @State private var searchText = ""
+    @State private var localSearch = ""
+    @State private var remoteSearch = ""
 
     private var session: SFTPSession? { tab.sftp }
-    /// Session-aware: SFTP/FTP always, SCP once its SFTP subsystem opened.
-    private var canBrowse: Bool { session?.isBrowsable ?? false }
-    private var isBlind: Bool { !canBrowse }
 
     var body: some View {
         VStack(spacing: 0) {
-            toolbar
-            HSplitPanes(tab: tab, localPane: localPane, searchText: searchText)
+            header
+            HSplitPanes(tab: tab, localPane: localPane,
+                        localSearch: $localSearch, remoteSearch: $remoteSearch)
             if let session { ActiveTransferBar(session: session) }
-            TransfersDrawer()
-            statusBar
         }
         .onAppear { tab.sftp?.startIfNeeded() }
         .background {
@@ -41,178 +40,117 @@ struct ConnectionView: View {
         }
     }
 
-    // MARK: - Toolbar
+    // MARK: - Header bar
 
-    private var toolbar: some View {
-        HStack(spacing: 10) {
-            ToolbarIcon(systemName: "chevron.up", enabled: canGoUp) {
-                session?.goUp()
-            }
-            .help("Parent folder")
-            .glassCapsule(interactive: true)
-
-            // Breadcrumb pill
-            HStack(spacing: 6) {
-                Image(systemName: tab.host.proto == .tftp ? "lock.open" : "lock")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(tab.host.proto == .tftp ? Theme.err : Theme.ok)
-                Text(breadcrumbUser)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Theme.dimText)
-                    .lineLimit(1)
-                Text("›")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.disabledText)
-                Text(remotePathText)
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 30)
-            .frame(maxWidth: .infinity)
-            .glassCapsule()
-
-            // Search
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Theme.disabledText)
-                TextField("Search this folder", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Theme.text)
-            }
-            .padding(.horizontal, 11)
-            .frame(width: 190, height: 30)
-            .glassCapsule()
-
-            ToolbarIcon(systemName: "arrow.clockwise", enabled: true) {
-                // A remote listing only exists for SFTP/FTP. On SCP/TFTP the
-                // refresh reloads the local pane only — calling refresh() there
-                // would fire a doomed SFTP list on a connection with no subsystem
-                // and leave a notice BlindPane never surfaces.
-                if canBrowse { session?.refresh() }
-                localPane.reload()
-            }
-            .glassCapsule(interactive: true)
-
-            // Queue toggle
-            Button {
-                model.drawerOpen.toggle()
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "square.and.arrow.down")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text("\(activeTransferCount)")
-                        .font(.system(size: 12.5, weight: .medium))
+    private var header: some View {
+        // No back button: the device list is always in the sidebar, so "back"
+        // only led to an empty hint page.
+        QuietHeaderBar(horizontalPadding: 24) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 10) {
+                    Text(tab.host.displayName)
+                        .font(Theme.pageTitle)
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(1)
+                        .accessibilityAddTraits(.isHeader)
+                    StatusPill(text: statusWord, kind: statusKind)
+                        .help(failureMessage ?? statusWord)
                 }
-                .foregroundStyle(model.drawerOpen ? .white : Theme.text2)
-                .padding(.horizontal, 12)
-                .frame(height: 30)
-                .contentShape(.capsule)
-                .glassEffect(model.drawerOpen ? .regular.tint(Theme.accent).interactive() : .regular.interactive(),
-                             in: .capsule)
+                Text(headerSubtitle)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
             }
-            .buttonStyle(.plain)
+            Spacer(minLength: 16)
+            if isLive {
+                Button("Disconnect") { session?.disconnect() }
+                    .buttonStyle(.quietBordered)
+            }
+            IconButton(systemName: "xmark", label: "Close session (⇧⌘W)",
+                       size: 32, symbolSize: 14, tint: Theme.muted) {
+                model.closeTab(tab)
+            }
         }
-        .padding(.leading, 6)
-        .padding(.trailing, 14)
-        .frame(height: 52)
     }
 
-    private var canGoUp: Bool {
-        guard let session, canBrowse else { return false }
-        return session.path != "/"
-    }
-
-    private var breadcrumbUser: String {
-        tab.host.username.isEmpty
-            ? tab.host.address
-            : "\(tab.host.username)@\(tab.host.address)"
-    }
-
-    private var remotePathText: String {
-        if isBlind { return "(no path)" }
-        return session?.path ?? "/"
-    }
-
-    private var activeTransferCount: Int {
-        model.tabs.compactMap(\.sftp).filter { $0.transfer != nil }.count
-    }
-
-    // MARK: - Status bar
-
-    private var statusBar: some View {
-        HStack(spacing: 14) {
-            Text(securityLine)
-                .font(.system(size: 11))
-                .foregroundStyle(Theme.dimText)
-                .lineLimit(1)
-            Spacer()
-            Text(countLine)
-                .font(.system(size: 11))
-                .foregroundStyle(Theme.faintText)
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 26)
-    }
-
-    private var securityLine: String {
-        let base: String
-        switch tab.host.proto {
-        case .sftp: base = "SFTP v3 over SSH-2"
-        case .scp: base = "SCP over SSH-2"
-        case .tftp: base = "TFTP RFC 1350 · UDP · no authentication, no encryption"
-        case .ftp: base = "FTP"
-        }
+    private var statusWord: String {
         switch tab.status {
-        case .connected: return "\(base) · connected"
-        case .connecting: return "\(base) · connecting…"
-        case .failed(let message): return message
-        case .disconnected: return "\(base) · not connected"
+        case .disconnected: "Not connected"
+        case .connecting: "Connecting…"
+        case .connected: "Connected"
+        case .failed: "Failed"
         }
     }
 
-    private var countLine: String {
-        guard canBrowse, let session else { return "" }
-        return session.entries.isEmpty ? "" : "\(session.entries.count) items"
+    private var statusKind: StatusPill.Kind {
+        switch tab.status {
+        case .disconnected: .neutral
+        case .connecting: .busy
+        case .connected: .ok
+        case .failed: .attention
+        }
+    }
+
+    private var failureMessage: String? {
+        if case .failed(let message) = tab.status { return message }
+        return nil
+    }
+
+    private var isLive: Bool {
+        if case .connected = tab.status { return true }
+        return false
+    }
+
+    /// `user@address[:port] · PROTO` — the port only when it isn't the
+    /// protocol's default.
+    private var headerSubtitle: String {
+        let host = tab.host
+        let port = host.port == host.proto.defaultPort ? "" : ":\(host.port)"
+        let who = host.username.isEmpty
+            ? "\(host.address)\(port)"
+            : "\(host.username)@\(host.address)\(port)"
+        return "\(who) · \(host.proto.label)"
     }
 }
 
-/// Always-visible progress card shown in the connection view (above the
-/// Transfers drawer) while a transfer is running — so the MB/percent bar is
-/// front-and-center without opening the drawer.
+/// The live transfer row (only while a transfer runs): one line — verb,
+/// filename, `done / total · %` — over a thin 4 pt bar.
 struct ActiveTransferBar: View {
     @ObservedObject var session: SFTPSession
 
     var body: some View {
         if let t = session.transfer {
-            VStack(spacing: 5) {
-                HStack(spacing: 8) {
-                    Image(systemName: t.isUpload ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
-                        .font(.system(size: 13))
-                        .foregroundStyle(Theme.accent)
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    Text(t.isUpload ? "Uploading" : "Downloading")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.ink)
                     Text(t.name)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(Theme.text)
+                        .font(Theme.detail)
+                        .foregroundStyle(Theme.muted)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 8)
                     Text(readout(t))
-                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Theme.dimText)
+                        .font(Theme.detail)
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.ink)
+                    IconButton(systemName: "xmark", label: "Cancel transfer",
+                               size: 24, symbolSize: 10, tint: Theme.muted) {
+                        session.cancelTransfer()
+                    }
                 }
-                ProgressView(value: t.fraction ?? 0)
-                    .progressViewStyle(.linear)
-                    .tint(Theme.accent)
+                QuietProgressBar(fraction: t.fraction)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .glassCard()
-            .padding(.horizontal, 10)
-            .padding(.top, 8)
+            .padding(.horizontal, 24)
+            .padding(.top, 12)
+            .padding(.bottom, 16)
+            .overlay(alignment: .top) {
+                Rectangle().fill(Theme.line).frame(height: 1)
+            }
+            .accessibilityElement(children: .contain)
         }
     }
 
@@ -238,49 +176,31 @@ private struct PasswordSheetPresenter: View {
     }
 }
 
-struct ToolbarIcon: View {
-    let systemName: String
-    var enabled = true
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(enabled ? Theme.dimText : Theme.disabledText.opacity(0.6))
-                .frame(width: 32, height: 30)
-                .contentShape(.capsule)
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .onHover { hovering = $0 }
-    }
-}
-
 // MARK: - Panes
 
 private struct HSplitPanes: View {
     @ObservedObject var tab: SessionTab
     @ObservedObject var localPane: LocalPaneModel
-    let searchText: String
+    @Binding var localSearch: String
+    @Binding var remoteSearch: String
 
     var body: some View {
         HStack(spacing: 0) {
-            LocalPaneView(localPane: localPane, searchText: searchText,
-                          canUpload: canUpload, onUpload: upload)
+            LocalPaneView(localPane: localPane, searchText: $localSearch)
                 .frame(maxWidth: .infinity)
-            Rectangle().fill(Theme.hairline).frame(width: 0.5)
-            Group {
-                if let session = tab.sftp, session.isBrowsable {
-                    RemoteListPane(tab: tab, session: session, searchText: searchText,
-                                   canDownload: canDownload, onDownload: download)
-                } else {
-                    BlindPane(tab: tab, localPane: localPane)
-                }
+            if let session = tab.sftp, session.isBrowsable {
+                TransferColumn(hostName: tab.host.displayName,
+                               canUpload: canUpload, canDownload: canDownload,
+                               onUpload: upload, onDownload: download)
+                RemoteListPane(tab: tab, session: session, searchText: $remoteSearch)
+                    .frame(maxWidth: .infinity)
+            } else {
+                Spacer().frame(width: 32)
+                BlindPane(tab: tab, localPane: localPane)
+                    .frame(maxWidth: .infinity)
             }
-            .frame(maxWidth: .infinity)
         }
+        .padding(EdgeInsets(top: 18, leading: 24, bottom: 12, trailing: 24))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -322,119 +242,189 @@ private struct HSplitPanes: View {
     }
 }
 
+/// The narrow column between the panes: → Upload (filled ink when enabled)
+/// and ← Download (outlined). These replace the old Put / Get text links.
+private struct TransferColumn: View {
+    let hostName: String
+    let canUpload: Bool
+    let canDownload: Bool
+    let onUpload: () -> Void
+    let onDownload: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Button(action: onUpload) {
+                Image(systemName: "arrow.right")
+            }
+            .buttonStyle(RoundTransferStyle(filled: true))
+            .disabled(!canUpload)
+            .help(canUpload ? "Upload the selected file to \(hostName)"
+                  : "Upload — select a file on this Mac first")
+            .accessibilityLabel("Upload to \(hostName)")
+
+            Button(action: onDownload) {
+                Image(systemName: "arrow.left")
+            }
+            .buttonStyle(RoundTransferStyle(filled: false))
+            .disabled(!canDownload)
+            .help(canDownload ? "Download the selected file to this Mac"
+                  : "Download — select a file on \(hostName) first")
+            .accessibilityLabel("Download to this Mac")
+        }
+        .frame(width: 72)
+        .frame(maxHeight: .infinity)
+    }
+}
+
+/// A 44 pt round icon button. Filled = ink disc when enabled; outlined =
+/// hairline ring. Disabled = a faint ring either way.
+private struct RoundTransferStyle: ButtonStyle {
+    let filled: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        RoundTransferBody(configuration: configuration, filled: filled)
+    }
+}
+
+private struct RoundTransferBody: View {
+    let configuration: ButtonStyleConfiguration
+    let filled: Bool
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        let solid = filled && isEnabled
+        configuration.label
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(solid ? Theme.background : (isEnabled ? Theme.ink : Theme.faint.opacity(0.6)))
+            .frame(width: 44, height: 44)
+            .background(Circle().fill(solid ? Theme.ink : Color.clear))
+            .overlay {
+                if !solid {
+                    Circle().strokeBorder(isEnabled ? Theme.ink.opacity(0.55) : Theme.control, lineWidth: 1)
+                }
+            }
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .contentShape(Circle())
+    }
+}
+
+/// A pane's header: title, inline path field and its icon buttons, then an
+/// optional filter row (revealed by the magnifier button).
+private struct PaneHeader<Leading: View, Trailing: View>: View {
+    @Binding var searchText: String
+    @Binding var showFilter: Bool
+    @ViewBuilder var leading: Leading
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                leading
+                trailing
+                IconButton(systemName: "line.3.horizontal.decrease", label: showFilter ? "Hide filter" : "Filter",
+                           tint: showFilter || !searchText.isEmpty ? Theme.ink : Theme.muted) {
+                    showFilter.toggle()
+                    if !showFilter { searchText = "" }
+                }
+            }
+            if showFilter || !searchText.isEmpty {
+                PaneSearchField(text: $searchText)
+            }
+        }
+        .padding(.leading, 4)
+        .padding(.bottom, 10)
+    }
+}
+
 struct LocalPaneView: View {
     @ObservedObject var localPane: LocalPaneModel
-    let searchText: String
-    var canUpload = false
-    var onUpload: () -> Void = {}
+    @Binding var searchText: String
+    @State private var showFilter = false
 
     var body: some View {
         VStack(spacing: 0) {
-            PaneStrip {
-                Image(systemName: "laptopcomputer")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.dimText)
+            PaneHeader(searchText: $searchText, showFilter: $showFilter) {
                 Text("This Mac")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Theme.text2)
+                    .font(Theme.emphasis)
+                    .foregroundStyle(Theme.ink)
+                    .fixedSize()
+                    .padding(.trailing, 2)
                 // Editable address bar: type a path (or `..`) + Enter to cd.
-                EditablePathField(path: localPane.displayPath) { localPane.open($0) }
-                Button {
-                    localPane.chooseDirectory()
-                } label: {
-                    Image(systemName: "folder")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.dimText)
-                }
-                .buttonStyle(.plain)
-                .help("Choose a folder…")
-                Button {
-                    localPane.goUp()
-                } label: {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Theme.dimText)
-                }
-                .buttonStyle(.plain)
-                .help("Parent folder (cd ..)")
-                Button(action: onUpload) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 14))
-                        .foregroundStyle(canUpload ? Theme.accent : Theme.disabledText.opacity(0.5))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canUpload)
-                .help("Upload selected file")
+                EditablePathField(path: localPane.displayPath, label: "Mac folder") { localPane.open($0) }
+            } trailing: {
+                IconButton(systemName: "arrow.up", label: "Parent folder") { localPane.goUp() }
+                    .disabled(!localPane.canGoUp)
+                IconButton(systemName: "folder", label: "Choose a folder…") { localPane.chooseDirectory() }
             }
             FileColumnHeader(showPerms: false)
             FileListView(
-                entries: filtered(localPane.entries),
+                entries: filtered(localPane.entries, searchText),
                 selection: $localPane.selection,
                 showPerms: false,
                 onOpen: { localPane.enter($0) }
             )
         }
-    }
-
-    private func filtered(_ entries: [FileEntry]) -> [FileEntry] {
-        guard !searchText.isEmpty else { return entries }
-        return entries.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("This Mac")
     }
 }
 
 struct RemoteListPane: View {
     @ObservedObject var tab: SessionTab
     @ObservedObject var session: SFTPSession
-    let searchText: String
-    var canDownload = false
-    var onDownload: () -> Void = {}
+    @Binding var searchText: String
+    @State private var showFilter = false
+
+    private var isConnected: Bool {
+        if case .connected = tab.status { return true }
+        return false
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            PaneStrip {
-                ProtoBadge(proto: tab.host.proto)
+            PaneHeader(searchText: $searchText, showFilter: $showFilter) {
+                Circle()
+                    .fill(Theme.protoColor(tab.host.proto))
+                    .frame(width: 8, height: 8)
+                    .accessibilityHidden(true)
                 Text(tab.host.displayName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Theme.text2)
+                    .font(Theme.emphasis)
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                    .frame(maxWidth: 160, alignment: .leading)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.trailing, 2)
                 // Editable address bar for the device side: type a remote path
                 // (or `..`) + Enter to cd there.
-                EditablePathField(path: session.path) { session.open($0) }
-                if session.isLoading {
-                    ProgressView().controlSize(.mini)
+                EditablePathField(path: session.path, label: "Device folder") { session.open($0) }
+            } trailing: {
+                IconButton(systemName: "arrow.up", label: "Parent folder") { session.goUp() }
+                    .disabled(session.path == "/" || !isConnected)
+                ZStack {
+                    IconButton(systemName: "arrow.clockwise", label: "Refresh") { session.refresh() }
+                        .disabled(!isConnected || session.isLoading)
+                        .opacity(session.isLoading ? 0 : 1)
+                    if session.isLoading {
+                        ProgressView().controlSize(.small)
+                            .accessibilityLabel("Loading")
+                    }
                 }
-                Button {
-                    session.goUp()
-                } label: {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(session.path == "/" ? Theme.disabledText.opacity(0.5) : Theme.dimText)
-                }
-                .buttonStyle(.plain)
-                .disabled(session.path == "/")
-                .help("Parent folder (cd ..)")
-                Button(action: onDownload) {
-                    Image(systemName: "arrow.down.circle.fill")
-                        .font(.system(size: 14))
-                        .foregroundStyle(canDownload ? Theme.accent : Theme.disabledText.opacity(0.5))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canDownload)
-                .help("Download selected file into the local folder")
+                .frame(width: 28, height: 28)
             }
             // Perms column only when the pane is wide enough — squeezed
             // columns ate the whole Name column at the minimum window size.
             GeometryReader { geo in
-                let showPerms = geo.size.width >= 430
+                let showPerms = geo.size.width >= 520
                 VStack(spacing: 0) {
                     FileColumnHeader(showPerms: showPerms)
                     ZStack {
                         FileListView(
-                            entries: filtered(session.entries),
+                            entries: filtered(session.entries, searchText),
                             selection: $session.selection,
                             showPerms: showPerms,
                             onOpen: { session.enter($0) }
                         )
-                        if case .connected = tab.status {} else {
+                        if !isConnected {
                             RemoteDisconnectedOverlay(tab: tab)
                         }
                     }
@@ -444,20 +434,54 @@ struct RemoteListPane: View {
                 NoticeBar(text: notice) { session.notice = nil }
             }
         }
-    }
-
-    private func filtered(_ entries: [FileEntry]) -> [FileEntry] {
-        guard !searchText.isEmpty else { return entries }
-        return entries.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(tab.host.displayName)
     }
 }
 
+/// The filter field revealed under a pane header: filled like the path field.
+struct PaneSearchField: View {
+    @Binding var text: String
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Theme.faint)
+            TextField("Filter by name", text: $text)
+                .textFieldStyle(.plain)
+                .font(Theme.body)
+                .foregroundStyle(Theme.ink)
+                .focused($focused)
+            if !text.isEmpty {
+                Button { text = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(Theme.faint)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear filter")
+            }
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 28)
+        .background(Theme.inset, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .onAppear { focused = true }
+    }
+}
+
+private func filtered(_ entries: [FileEntry], _ searchText: String) -> [FileEntry] {
+    guard !searchText.isEmpty else { return entries }
+    return entries.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+}
+
 /// A path shown in a pane header that doubles as a `cd`-style address bar:
-/// looks like the plain path until focused, accepts a typed path (absolute,
-/// `~`, or relative with `..`) and navigates on Return. Stays in sync with the
-/// pane's current path while not being edited.
+/// a quiet filled field showing the current path; accepts a typed path
+/// (absolute, `~`, or relative with `..`) and navigates on Return. Stays in
+/// sync with the pane's current path while not being edited.
 struct EditablePathField: View {
     let path: String
+    var label = "Folder path"
     let onGo: (String) -> Void
     @State private var draft = ""
     @FocusState private var focused: Bool
@@ -465,12 +489,23 @@ struct EditablePathField: View {
     var body: some View {
         TextField("path", text: $draft)
             .textFieldStyle(.plain)
-            .font(.system(size: 12))
-            .foregroundStyle(focused ? Theme.text : Theme.disabledText)
+            .font(Theme.mono)
+            .foregroundStyle(Theme.ink)
             .lineLimit(1)
             .truncationMode(.head)
-            .frame(maxWidth: .infinity, alignment: .leading)
             .focused($focused)
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.inset, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay {
+                if focused {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.control, lineWidth: 1)
+                }
+            }
+            .accessibilityLabel(label)
+            .help("Type a path and press Return")
             .onSubmit { onGo(draft); focused = false }
             .onChange(of: path) { _, newPath in if !focused { draft = newPath } }
             .onChange(of: focused) { _, isFocused in if !isFocused { draft = path } }
@@ -478,6 +513,7 @@ struct EditablePathField: View {
     }
 }
 
+/// A plain pane header row (used by the blind pane, which has no path).
 struct PaneStrip<Content: View>: View {
     @ViewBuilder var content: Content
 
@@ -485,28 +521,9 @@ struct PaneStrip<Content: View>: View {
         HStack(spacing: 8) {
             content
         }
-        .padding(.horizontal, 14)
-        .frame(height: 34)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
-        }
-    }
-}
-
-struct ProtoBadge: View {
-    let proto: TransferProtocolKind
-
-    var body: some View {
-        Text(proto.label)
-            .font(.system(size: 9.5, weight: .bold))
-            .kerning(0.3)
-            .foregroundStyle(Theme.protoColor(proto))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Theme.protoColor(proto).opacity(0.12))
-            )
+        .padding(.leading, 4)
+        .frame(height: 28)
+        .padding(.bottom, 10)
     }
 }
 
@@ -514,45 +531,36 @@ struct RemoteDisconnectedOverlay: View {
     @ObservedObject var tab: SessionTab
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(alignment: .center, spacing: 12) {
             if case .connecting = tab.status {
                 ProgressView().controlSize(.small)
                 Text("Connecting…")
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Theme.dimText)
+                    .font(Theme.body)
+                    .foregroundStyle(Theme.muted)
             } else {
-                Color.clear
-                    .frame(width: 56, height: 56)
-                    .glassEffect(hasFailed ? .regular.tint(Theme.err.opacity(0.35)) : .regular,
-                                 in: .rect(cornerRadius: 16))
-                    .overlay(
-                        Image(systemName: hasFailed ? "exclamationmark.triangle" : "server.rack")
-                            .font(.system(size: 22, weight: .light))
-                            .foregroundStyle(hasFailed ? Theme.err : Theme.faintText)
-                    )
                 Text(hasFailed ? "Couldn’t connect" : "Not connected")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Theme.text)
+                    .font(Theme.subtitle)
+                    .foregroundStyle(Theme.ink)
                 if hasFailed {
                     Text(statusText)
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.dimText)
+                        .font(Theme.detail)
+                        .foregroundStyle(Theme.attention)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 340)
+                        .textSelection(.enabled)
                 }
                 Button {
                     tab.sftp?.retry()
                 } label: {
                     Text(hasFailed ? "Try Again" : "Connect")
-                        .font(.system(size: 12.5, weight: .medium))
-                        .padding(.horizontal, 12)
                 }
-                .buttonStyle(.glassProminent)
-                .tint(Theme.accent)
-                .controlSize(.large)
+                .buttonStyle(QuietPrimaryStyle(height: 36, size: 14))
+                .padding(.top, 4)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .background(Theme.background.opacity(0.92))
     }
 
     private var hasFailed: Bool {
@@ -571,30 +579,24 @@ struct NoticeBar: View {
     let dismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 10))
+        HStack(spacing: 8) {
             Text(text)
-                .font(.system(size: 10.5))
+                .font(Theme.small)
+                .foregroundStyle(Theme.muted)
                 .lineLimit(2)
+                .textSelection(.enabled)
             Spacer(minLength: 0)
-            Button(action: dismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
-            }
-            .buttonStyle(.plain)
+            IconButton(systemName: "xmark", label: "Dismiss", size: 22, symbolSize: 10, tint: Theme.muted, action: dismiss)
         }
-        .foregroundStyle(Theme.dimText)
-        .padding(.horizontal, 12)
+        .padding(.leading, 10)
+        .padding(.trailing, 4)
         .padding(.vertical, 5)
-        .background(.regularMaterial)
-        .overlay(alignment: .top) {
-            Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
-        }
+        .background(Theme.inset, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .padding(.top, 8)
     }
 }
 
-// MARK: - Blind pane (SCP / TFTP / FTP-until-built)
+// MARK: - Blind pane (SCP without SFTP / TFTP)
 
 struct BlindPane: View {
     @ObservedObject var tab: SessionTab
@@ -609,81 +611,79 @@ struct BlindPane: View {
     var body: some View {
         VStack(spacing: 0) {
             PaneStrip {
-                ProtoBadge(proto: tab.host.proto)
+                Circle()
+                    .fill(Theme.protoColor(tab.host.proto))
+                    .frame(width: 8, height: 8)
+                    .accessibilityHidden(true)
                 Text(tab.host.displayName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Theme.text2)
-                Text("(no path)")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.disabledText)
+                    .font(Theme.emphasis)
+                    .foregroundStyle(Theme.ink)
+                Text("no folder listing")
+                    .font(Theme.small)
+                    .foregroundStyle(Theme.faint)
                 Spacer(minLength: 0)
                 if isSCP { scpStatus }
             }
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Theme.line).frame(height: 1).offset(y: 0)
+            }
 
-            VStack(spacing: 0) {
-                Spacer()
-                VStack(spacing: 16) {
-                    Color.clear
-                        .frame(width: 56, height: 56)
-                        .glassEffect(.regular, in: .rect(cornerRadius: 16))
-                        .overlay(
-                            Image(systemName: "eye.slash")
-                                .font(.system(size: 22, weight: .light))
-                                .foregroundStyle(Theme.faintText)
-                        )
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
                     Text(blindTitle)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(Theme.text)
+                        .font(Theme.subtitle)
+                        .foregroundStyle(Theme.ink)
                     Text(blindBody)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(Theme.dimText)
-                        .multilineTextAlignment(.center)
+                        .font(Theme.body)
+                        .foregroundStyle(Theme.muted)
+                        .multilineTextAlignment(.leading)
                         .lineSpacing(3)
-                        .frame(maxWidth: 360)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("REMOTE FILENAME")
-                            .font(.system(size: 11, weight: .semibold))
-                            .kerning(0.3)
-                            .foregroundStyle(Theme.faintText)
+                        Text("Remote filename")
+                            .font(Theme.groupLabel)
+                            .tracking(0.66)
+                            .textCase(.uppercase)
+                            .foregroundStyle(Theme.muted)
                         TextField(isSCP ? "flash:/image.swi or /var/log/messages"
                             : "ArubaCX-10.13-boot.swi", text: $remoteName)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 12.5, design: .monospaced))
-                            .foregroundStyle(Theme.text)
-                            .padding(.horizontal, 10)
-                            .frame(height: 32)
-                            .glassEffect(.regular, in: .rect(cornerRadius: Glass.fieldRadius))
-                        HStack(spacing: 8) {
-                            BlindButton(title: "Put file", systemName: "arrow.up",
-                                        prominent: true, enabled: canPut) { put() }
-                            BlindButton(title: "Get file", systemName: "arrow.down",
-                                        prominent: false, enabled: canGet) { get() }
+                            .textFieldStyle(QuietBoxFieldStyle(size: 13))
+                            .font(Theme.mono)
+                            .accessibilityLabel("Remote filename")
+                        HStack(spacing: 10) {
+                            Button("Put file") { put() }
+                                .buttonStyle(.quietPrimary)
+                                .disabled(!canPut)
+                                .help("Upload the selected Mac file to the remote filename")
+                            Button("Get file") { get() }
+                                .buttonStyle(.quietBordered)
+                                .disabled(!canGet)
+                                .help("Download the remote filename into the Mac folder")
                         }
+                        .padding(.top, 4)
                         if let transfer = session?.transfer {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
                                 Text(transferText(transfer))
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(Theme.dimText)
+                                    .font(Theme.small)
+                                    .foregroundStyle(Theme.muted)
                             }
                         } else if let feedback {
-                            Text(feedback)
-                                .font(.system(size: 11))
-                                .foregroundStyle(feedbackIsError ? Theme.err : Theme.ok)
-                                .lineLimit(3)
+                            StateText(text: feedback, attention: feedbackIsError)
                         }
                         Text(blindFoot)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.faintText)
+                            .font(Theme.small)
+                            .foregroundStyle(Theme.muted)
                             .lineSpacing(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .frame(maxWidth: 400)
                 }
-                .padding(.horizontal, 44)
-                Spacer()
+                .frame(maxWidth: 420, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 24)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -691,12 +691,12 @@ struct BlindPane: View {
     private var scpStatus: some View {
         switch tab.status {
         case .connecting:
-            ProgressView().controlSize(.mini)
+            StateText(text: "Connecting…")
         case .connected:
-            Circle().fill(Theme.live).frame(width: 7, height: 7)
+            EmptyView()
         default:
             Button("Connect…") { session?.retry() }
-                .controlSize(.small)
+                .buttonStyle(.quietBorderedSmall)
         }
     }
 
@@ -715,7 +715,7 @@ struct BlindPane: View {
             let selected = localPane.selection.map { "PUT sends “\($0)”. " } ?? "Select a local file to PUT. "
             return selected + "GET saves into \(localPane.displayPath)."
         }
-        return "The TFTP client lands in a later build — use Serve mode and let the device pull instead. With blksize 1468 a TFTP file caps at ~96 MB; anything larger goes over SFTP/SCP."
+        return "The TFTP client lands in a later build — use Server mode and let the device pull instead. With blksize 1468 a TFTP file caps at ~96 MB; anything larger goes over SFTP/SCP."
     }
 
     private var canPut: Bool {
@@ -749,7 +749,7 @@ struct BlindPane: View {
         let target = remoteName.trimmingCharacters(in: .whitespaces)
         session.scpPush(localURL: file, remotePath: target) { error in
             feedbackIsError = error != nil
-            feedback = error ?? "Sent \(file.lastPathComponent) ✓"
+            feedback = error ?? "Sent \(file.lastPathComponent)"
             AppModel.shared.recordTransfer(
                 name: file.lastPathComponent,
                 detail: "SCP · \(tab.host.displayName) \(target)",
@@ -763,7 +763,7 @@ struct BlindPane: View {
         let target = remoteName.trimmingCharacters(in: .whitespaces)
         session.scpPull(remotePath: target, into: localPane.directoryURL) { error in
             feedbackIsError = error != nil
-            feedback = error ?? "Saved into \(localPane.displayPath) ✓"
+            feedback = error ?? "Saved into \(localPane.displayPath)"
             localPane.reload()
             AppModel.shared.recordTransfer(
                 name: (target as NSString).lastPathComponent,
@@ -780,131 +780,40 @@ struct BlindPane: View {
     }
 }
 
-struct BlindButton: View {
-    let title: String
-    let systemName: String
-    var prominent: Bool
-    var enabled: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: systemName)
-                    .font(.system(size: 11, weight: .semibold))
-                Text(title)
-                    .font(.system(size: 12.5, weight: .medium))
-            }
-            .foregroundStyle(prominent ? .white : Theme.text)
-            .frame(maxWidth: .infinity)
-            .frame(height: 32)
-            .contentShape(.capsule)
-            .glassEffect(prominent ? .regular.tint(Theme.accent).interactive() : .regular.interactive(),
-                         in: .capsule)
-            .opacity(enabled ? 1 : 0.45)
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-    }
-}
-
-// MARK: - Transfers drawer
-
-struct TransfersDrawer: View {
-    @ObservedObject private var model = AppModel.shared
-
-    private var liveTransfers: [(tab: SessionTab, transfer: SFTPSession.TransferState)] {
-        model.tabs.compactMap { tab in
-            guard let transfer = tab.sftp?.transfer else { return nil }
-            return (tab, transfer)
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Header (always visible)
-            HStack(spacing: 8) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Theme.faintText)
-                    .rotationEffect(.degrees(model.drawerOpen ? 90 : 0))
-                Text("Transfers")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Theme.text2)
-                Text(summary)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.faintText)
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 32)
-            .overlay(alignment: .top) {
-                Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                withAnimation(.easeOut(duration: 0.15)) { model.drawerOpen.toggle() }
-            }
-
-            if model.drawerOpen {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(liveTransfers, id: \.tab.id) { item in
-                            LiveTransferRow(tab: item.tab)
-                        }
-                        ForEach(model.transferHistory.prefix(8)) { record in
-                            HistoryTransferRow(record: record)
-                        }
-                        if liveTransfers.isEmpty && model.transferHistory.isEmpty {
-                            Text("No transfers yet")
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(Theme.faintText)
-                                .padding(.vertical, 20)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                }
-                .frame(height: 138)
-            }
-        }
-    }
-
-    private var summary: String {
-        let active = liveTransfers.count
-        if active > 0 { return "\(active) active" }
-        let done = model.transferHistory.count
-        return done == 0 ? "" : "\(done) recent"
-    }
-}
+// MARK: - Transfer rows (Activity page)
 
 struct LiveTransferRow: View {
     @ObservedObject var tab: SessionTab
 
     var body: some View {
         if let session = tab.sftp, let transfer = session.transfer {
-            HStack(spacing: 10) {
-                TransferIcon(isUpload: transfer.isUpload, failed: false, active: true)
-                VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 12) {
+                TransferGlyph(isUpload: transfer.isUpload)
+                VStack(alignment: .leading, spacing: 2) {
                     Text(transfer.name)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(Theme.text)
+                        .font(Theme.name)
+                        .foregroundStyle(Theme.ink)
                         .lineLimit(1)
-                    Text("\(tab.host.proto.label) · \(tab.host.displayName)")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.faintText)
+                        .truncationMode(.middle)
+                    Text("\(transfer.isUpload ? "Uploading to" : "Downloading from") \(tab.host.displayName) · \(tab.host.proto.label)")
+                        .font(Theme.small)
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
                 }
-                .frame(width: 230, alignment: .leading)
-                ProgressView(value: transfer.fraction ?? 0)
-                    .progressViewStyle(.linear)
-                    .tint(Theme.protoColor(tab.host.proto))
+                .frame(minWidth: 200, maxWidth: 300, alignment: .leading)
+                QuietProgressBar(fraction: transfer.fraction)
                 Text(progressText(transfer))
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Theme.faintText)
-                    .frame(width: 140, alignment: .trailing)
+                    .font(Theme.detail)
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.ink)
+                    .frame(width: 170, alignment: .trailing)
             }
-            .padding(.horizontal, 8)
-            .frame(height: 40)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 12)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Theme.line).frame(height: 1)
+            }
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -923,47 +832,48 @@ struct HistoryTransferRow: View {
     let record: TransferRecord
 
     var body: some View {
-        HStack(spacing: 10) {
-            TransferIcon(isUpload: record.isUpload, failed: record.failed, active: false)
-            VStack(alignment: .leading, spacing: 1) {
+        HStack(spacing: 12) {
+            TransferGlyph(isUpload: record.isUpload, failed: record.failed)
+            VStack(alignment: .leading, spacing: 2) {
                 Text(record.name)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Theme.text)
+                    .font(Theme.name)
+                    .foregroundStyle(record.failed ? Theme.attention : Theme.ink)
                     .lineLimit(1)
+                    .truncationMode(.middle)
                 Text(record.detail)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.faintText)
+                    .font(Theme.small)
+                    .foregroundStyle(Theme.muted)
                     .lineLimit(1)
             }
             Spacer()
-            Text(record.failed ? "Failed" : "Done")
-                .font(.system(size: 10.5, weight: .bold))
-                .foregroundStyle(record.failed ? Theme.err : Theme.ok)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill((record.failed ? Theme.err : Theme.ok).opacity(0.14))
-                )
+            Text(DateFormat.string(record.finished))
+                .font(Theme.detail)
+                .monospacedDigit()
+                .foregroundStyle(Theme.muted)
+            StatusPill(text: record.cancelled ? "Cancelled" : record.failed ? "Failed" : "Done",
+                       kind: record.cancelled ? .neutral : record.failed ? .attention : .ok)
+                .frame(width: 76, alignment: .trailing)
         }
-        .padding(.horizontal, 8)
-        .frame(height: 36)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 12)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Theme.line).frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
-struct TransferIcon: View {
+/// The one glyph a transfer row needs, monochrome; failed rows take the
+/// attention colour, everything else stays grey.
+struct TransferGlyph: View {
     let isUpload: Bool
-    let failed: Bool
-    let active: Bool
+    var failed = false
 
     var body: some View {
         Image(systemName: isUpload ? "arrow.up" : "arrow.down")
-            .font(.system(size: 11, weight: .bold))
-            .foregroundStyle(failed ? Theme.err : active ? Theme.accent : Theme.faintText)
-            .frame(width: 22, height: 22)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(failed ? Theme.err.opacity(0.12) : Theme.hover)
-            )
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(failed ? Theme.attention : Theme.muted)
+            .frame(width: 22)
+            .accessibilityLabel(isUpload ? "Upload" : "Download")
     }
 }

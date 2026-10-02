@@ -1,5 +1,17 @@
-import CLibSSH
 import Foundation
+
+/// The channel surface the SCP server handler needs, injected by the
+/// listener (the implementation drives SSHServerConnection over the socket).
+nonisolated protocol SCPChannel: AnyObject {
+    /// Writes all bytes; false when the channel is gone.
+    func write(_ bytes: [UInt8]) -> Bool
+    /// Blocks until one byte is available; nil when the channel dies.
+    func readByte() -> UInt8?
+    /// Blocks until `count` bytes arrive (or the channel dies — nil).
+    func readBytes(_ count: Int) -> [UInt8]?
+    func sendExitStatus(_ code: Int32)
+    func sendEOFAndClose()
+}
 
 /// Server side of the SCP wire protocol, over one exec channel of the shared
 /// SSH server. Lets a device pull with `copy scp://user@mac:port/file dest`
@@ -11,7 +23,7 @@ import Foundation
 /// protocol: control bytes are `\0` acks; a file starts with a `C<mode> <size>
 /// <name>\n` header.
 nonisolated final class SCPServerHandler {
-    private let channel: ssh_channel
+    private let channel: SCPChannel
     private let command: String
     private let root: URL
     /// Closure so the "Allow writes" toggle applies to live connections.
@@ -22,7 +34,7 @@ nonisolated final class SCPServerHandler {
     /// Unique per connection — see ServeTransfer.token.
     private let token = UUID().uuidString
 
-    init(channel: ssh_channel, command: String, root: URL,
+    init(channel: SCPChannel, command: String, root: URL,
          allowWrites: @escaping @Sendable () -> Bool,
          peer: String, onLog: @escaping @Sendable (TFTPLogEntry) -> Void,
          onProgress: @escaping ServeProgress = { _ in }) {
@@ -65,8 +77,7 @@ nonisolated final class SCPServerHandler {
             // If a transfer was in flight and never completed, fail ITS bar
             // (id-scoped); a browse/handshake-only connection touched no bar.
             if var t = lastActive, !completed { t.state = .failed; onProgress(t) }
-            ssh_channel_send_eof(channel)
-            ssh_channel_close(channel)
+            channel.sendEOFAndClose()
         }
         let args = command.split(separator: " ").map(String.init)
         let isSource = args.contains("-f")   // device pulls FROM us
@@ -124,9 +135,7 @@ nonisolated final class SCPServerHandler {
         while sent < size {
             guard let chunk = (try? handle.read(upToCount: 512 * 1024)).flatMap({ $0 }),
                   !chunk.isEmpty else { break }
-            let ok = chunk.withUnsafeBytes { raw in
-                writeBytes(raw.baseAddress, raw.count)
-            }
+            let ok = writeBytes(Array(chunk))
             guard ok else { return }
             sent += chunk.count
             reportProgress(name: name, isUpload: false, done: Int64(sent), total: Int64(size), lastReported: &lastReported)
@@ -255,7 +264,7 @@ nonisolated final class SCPServerHandler {
         let candidate = root.appendingPathComponent(trimmed).standardizedFileURL
         let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
         if candidate.path == root.path || candidate.path.hasPrefix(rootPath) {
-            return candidate
+            return ServedPath.confined(candidate, to: root)     // symlinks too
         }
         return nil
     }
@@ -263,30 +272,16 @@ nonisolated final class SCPServerHandler {
     // MARK: - Channel I/O
 
     private func write(_ text: String) -> Bool {
-        var bytes = Array(text.utf8)
-        return ssh_channel_write(channel, &bytes, UInt32(bytes.count)) == Int32(bytes.count)
+        channel.write(Array(text.utf8))
     }
 
     @discardableResult
     private func writeByte(_ byte: UInt8) -> Bool {
-        var b = byte
-        return ssh_channel_write(channel, &b, 1) == 1
+        channel.write([byte])
     }
 
-    private func writeBytes(_ base: UnsafeRawPointer?, _ count: Int) -> Bool {
-        guard let base else { return false }
-        var offset = 0
-        while offset < count {
-            let n = ssh_channel_write(channel, base.advanced(by: offset), UInt32(count - offset))
-            guard n > 0 else { return false }
-            offset += Int(n)
-        }
-        return true
-    }
-
-    private func readByte() -> UInt8? {
-        var b: UInt8 = 0
-        return ssh_channel_read(channel, &b, 1, 0) == 1 ? b : nil
+    private func writeBytes(_ bytes: [UInt8]) -> Bool {
+        channel.write(bytes)
     }
 
     /// scp acks are a single `\0`; anything else is an error string.
@@ -298,11 +293,13 @@ nonisolated final class SCPServerHandler {
         return false
     }
 
+    private func readByte() -> UInt8? {
+        channel.readByte()
+    }
+
     private func readBytes(_ count: Int) -> Data? {
-        var buffer = [UInt8](repeating: 0, count: count)
-        let n = ssh_channel_read(channel, &buffer, UInt32(count), 0)
-        guard n > 0 else { return nil }
-        return Data(buffer[0..<Int(n)])
+        guard let bytes = channel.readBytes(count) else { return nil }
+        return Data(bytes)
     }
 
     private func readLine() -> String? {
@@ -326,7 +323,7 @@ nonisolated final class SCPServerHandler {
     }
 
     private func exit(_ code: Int32) {
-        ssh_channel_request_send_exit_status(channel, code)
+        channel.sendExitStatus(code)
     }
 
     private func log(isWrite: Bool, name: String, detail: String, failed: Bool = false) {

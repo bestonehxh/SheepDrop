@@ -71,8 +71,14 @@ final class LocalPaneModel: ObservableObject {
         reload()
     }
 
+    /// At `/` this is a no-op — `deleteLastPathComponent()` on "/" appends
+    /// "/..", so pressing Up at the root used to grow `/../../..` forever.
+    var canGoUp: Bool { directoryURL.standardizedFileURL.path != "/" }
+
     func goUp() {
-        directoryURL.deleteLastPathComponent()
+        let current = directoryURL.standardizedFileURL
+        guard current.path != "/" else { return }
+        directoryURL = current.deletingLastPathComponent().standardizedFileURL
         selection = nil
         reload()
     }
@@ -120,26 +126,37 @@ final class LocalPaneModel: ObservableObject {
     }
 }
 
+/// Column widths shared by the header and the rows so they line up.
+enum FileColumns {
+    static let size: CGFloat = 84
+    static let perms: CGFloat = 84
+    static let modified: CGFloat = 110
+    static let icon: CGFloat = 22
+    static let rowHeight: CGFloat = 34
+}
+
 struct FileColumnHeader: View {
     var showPerms = false
 
     var body: some View {
         HStack(spacing: 8) {
             Text("Name")
+                .padding(.leading, FileColumns.icon)
             Spacer()
-            Text("Size").frame(width: 72, alignment: .trailing)
+            Text("Size").frame(width: FileColumns.size, alignment: .trailing)
             if showPerms {
-                Text("Perms").frame(width: 84, alignment: .trailing)
+                Text("Perms").frame(width: FileColumns.perms, alignment: .trailing)
             }
-            Text("Modified").frame(width: 96, alignment: .trailing)
+            Text("Modified").frame(width: FileColumns.modified, alignment: .trailing)
         }
-        .font(.system(size: 11, weight: .medium))
-        .foregroundStyle(Theme.faintText)
-        .padding(.horizontal, 14)
-        .frame(height: 26)
+        .font(Theme.columnHeader)
+        .foregroundStyle(Theme.faint)
+        .padding(.horizontal, 10)
+        .frame(height: 30)
         .overlay(alignment: .bottom) {
-            Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
+            Rectangle().fill(Theme.line).frame(height: 1)
         }
+        .accessibilityHidden(true)
     }
 }
 
@@ -159,57 +176,56 @@ struct FileListView: View {
                         .simultaneousGesture(TapGesture().onEnded { selection = entry.name })
                 }
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
+            .padding(.vertical, 4)
         }
     }
 }
 
+/// One file row: 34 pt ("Comfortable"), 14 pt name, 13 pt size/date in the
+/// secondary grey; the selection is a rounded fill.
 struct FileRow: View {
     let entry: FileEntry
     let isSelected: Bool
     var showPerms = false
 
-    private var fg: Color { isSelected ? .white : Theme.text }
-    private var dim: Color { isSelected ? .white.opacity(0.78) : Theme.faintText }
-
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: entry.isDirectory ? "folder.fill" : "doc")
-                .font(.system(size: 12))
-                .foregroundStyle(entry.isDirectory
-                    ? (isSelected ? .white : Theme.dynamic(light: 0xD67B70, dark: 0xEDA79E))
-                    : dim)
-                .frame(width: 16)
+        HStack(spacing: 0) {
+            // Functional glyphs: they tell file from folder.
+            Image(systemName: entry.isDirectory ? "folder" : "doc")
+                .font(.system(size: 14))
+                .foregroundStyle(entry.isDirectory ? Theme.folder : Theme.faint)
+                .frame(width: FileColumns.icon, alignment: .leading)
             Text(entry.name)
-                .font(.system(size: 12.5))
-                .foregroundStyle(fg)
+                .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(Theme.ink)
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 8)
-            Text(entry.isDirectory ? "--" : ByteFormat.string(entry.size))
-                .font(.system(size: 12))
-                .foregroundStyle(dim)
-                .monospacedDigit()
-                .frame(width: 72, alignment: .trailing)
-            if showPerms {
-                Text(entry.permissions ?? "")
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(dim)
-                    .frame(width: 84, alignment: .trailing)
+            HStack(spacing: 8) {
+                Text(entry.isDirectory ? "—" : ByteFormat.string(entry.size))
+                    .frame(width: FileColumns.size, alignment: .trailing)
+                if showPerms {
+                    Text(entry.permissions ?? "")
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(width: FileColumns.perms, alignment: .trailing)
+                }
+                Text(DateFormat.string(entry.modified))
+                    .frame(width: FileColumns.modified, alignment: .trailing)
             }
-            Text(DateFormat.string(entry.modified))
-                .font(.system(size: 12))
-                .foregroundStyle(dim)
-                .monospacedDigit()
-                .frame(width: 96, alignment: .trailing)
+            .font(Theme.detail)
+            .foregroundStyle(Theme.muted)
+            .monospacedDigit()
+            .lineLimit(1)
         }
-        .padding(.horizontal, 8)
-        .frame(height: 28)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(isSelected ? Theme.accent : .clear)
-        )
+        .padding(.horizontal, 10)
+        .frame(height: FileColumns.rowHeight)
+        .background {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Theme.selection)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
@@ -232,8 +248,8 @@ nonisolated enum ByteFormat {
 @MainActor
 enum DateFormat {
     private static let time = make("HH:mm")
-    private static let thisYear = make("d MMM HH:mm")
-    private static let older = make("d MMM yyyy")
+    private static let thisYear = make("MMM d, HH:mm")
+    private static let older = make("MMM d, yyyy")
 
     private static func make(_ format: String) -> DateFormatter {
         let formatter = DateFormatter()

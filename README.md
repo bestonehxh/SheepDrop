@@ -14,11 +14,11 @@ command — no separate TFTP daemon to configure.
 
 ## ⬇️ Download
 
-[![Download SheepDrop for macOS](https://img.shields.io/badge/Download-SheepDrop_1.2_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/SheepDrop/releases/latest)
+[![Download SheepDrop for macOS](https://img.shields.io/badge/Download-SheepDrop_1.3_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/SheepDrop/releases/latest)
 
 **[Get the latest release →](https://github.com/bestonehxh/SheepDrop/releases/latest)** — download the `.zip`, unzip, and drag **SheepDrop.app** into `Applications`.
 
-> The build is unsigned (not notarized), so macOS will warn on first launch —
+> The build is not notarized, so macOS will warn on first launch —
 > right-click the app and choose **Open**, or run
 > `xattr -dr com.apple.quarantine /Applications/SheepDrop.app`
 >
@@ -39,18 +39,22 @@ SheepDrop is one of a few small native macOS apps for network engineers:
 ## Features
 
 ### Connect to a device (client)
-- **SFTP** and **SCP** over bundled libssh 0.12 — browse the remote filesystem in a
-  **dual-pane** view (This Mac ⇄ device), with per-pane `cd`-style address bars and back
-  navigation
+- **SFTP** and **SCP** on SheepDrop's own SSH implementation — no OpenSSL or libssh, only
+  Apple's crypto frameworks underneath. Browse the device in a **dual-pane** view
+  (This Mac ⇄ device) with a `cd`-style address bar on each side
+- **Fast transfers** — SFTP keeps many requests in flight (like OpenSSH), so large firmware
+  images move at full link speed; a running transfer can be **cancelled** at any time, and an
+  interrupted download never leaves a half-written file behind
 - **SCP browses like WinSCP** — when a device serves the SFTP subsystem, an SCP session
   becomes fully browsable instead of blind put/get
 - **FTP** and **TFTP** for older gear
-- **Legacy SSH that just works on old switches** — the server offers modern algorithms
-  first and falls back to the legacy KEX, ciphers, MACs, and `ssh-rsa` host keys that old
-  Cisco IOS / Aruba / HPE gear is limited to, so a modern client is never downgraded but an
-  old one still connects
-- **Quick Connect** — type `admin@10.0.0.1`, `admin@sw01:2222`, pick the protocol, and go
-- Sidebar with **host groups**, search, and recent connections
+- **Legacy SSH that just works on old switches** — modern algorithms first, with the legacy
+  KEX, ciphers, MACs, and `ssh-rsa` host keys that old Cisco IOS / Aruba / HPE gear is limited
+  to, so a modern device is never downgraded but an old one still connects
+- **Host-key pinning** in `~/.ssh/known_hosts` — a changed key is refused, never silently accepted
+- **Add Device** (⌘T) — type `admin@10.0.0.1`, pick the protocol, and go
+- Sidebar with **host groups** (drag to reorder) and recent connections; each host shows
+  whether its session is connected
 
 ### Let a device reach your Mac (built-in server)
 - One-switch **TFTP**, **SFTP / SCP**, and **FTP** servers so a device can run
@@ -58,24 +62,32 @@ SheepDrop is one of a few small native macOS apps for network engineers:
   a served folder on your Mac
 - **SCP / SFTP share one SSH server on port 22** (falls back to 2222 if macOS Remote Login
   owns 22) — `copy scp:` on switches always uses port 22, and SheepDrop binds it
-- **Live request log** and an always-present **transfer bar** showing upload/download
-  progress, held as history when a transfer finishes
-- **Allow-writes** toggle for device backups, applied live without a restart
+- **Live request log** and a **transfer bar** showing upload/download progress, kept as
+  history when a transfer finishes
+- **Allow-writes** toggle for device backups, applied live without a restart; uploads land
+  atomically, so an interrupted push never replaces a good file
 
 ### Security
-- The server authenticates against an app-defined **virtual username + password** — never
-  your macOS account
-- Passwords are stored **only in the macOS Keychain** — never in config files or exports
+- The SSH and FTP servers authenticate against an app-defined **virtual username + password** —
+  never your macOS account — and nothing is served before login succeeds
+- Every server is **confined to the served folder**, symlinks included
+- **Brute-force and flood limits** — failed logins drop the connection, and connections per
+  device are capped; TFTP replies from a fresh port per transfer (RFC 1350)
+- Server host keys are private to your user account; passwords are stored **only in the
+  macOS Keychain** — never in config files or exports
+
+### Design
+- A calm, readable monochrome interface with large type, light and dark appearance, and one
+  place for every action (plus the menu bar)
 
 ## Requirements
 
 - macOS 26 (Tahoe) or later, Apple Silicon
-- To build: Xcode 26+ and Homebrew `libssh`
+- To build: Xcode 26+ (no Homebrew dependencies)
 
 ## Building
 
 ```bash
-brew install libssh
 xcodebuild -project SheepDrop.xcodeproj -scheme SheepDrop -configuration Release build
 ```
 
@@ -84,7 +96,8 @@ The app is built at
 
 ## Acknowledgements
 
-- [libssh](https://www.libssh.org) (LGPL-2.1) — SSH / SFTP / SCP transport, bundled as a dynamic library
+- SSH is implemented in Swift on top of Apple CryptoKit and Security.framework (shared with
+  [SheepTerm](https://github.com/bestonehxh/SheepTerm)).
 
 ## License
 

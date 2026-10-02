@@ -163,8 +163,20 @@ nonisolated final class TFTPServer: @unchecked Sendable {
         init(_ value: T) { self.value = value }
     }
 
+    /// Transfers at once, overall and per device address. TFTP has no login,
+    /// so these caps are what keeps one host (or spoofed RRQs) from opening
+    /// unbounded sessions and file handles.
+    private static let maximumSessions = 32
+    private static let maximumPerPeer = 4
+
     private func accept(_ connection: NWConnection) {
         let session = Session(server: self, connection: connection)
+        let host = session.peerHost
+        guard sessions.count < Self.maximumSessions,
+              sessions.values.filter({ $0.peerHost == host }).count < Self.maximumPerPeer else {
+            connection.cancel()
+            return
+        }
         sessions[ObjectIdentifier(session)] = session
         session.begin()
     }
@@ -182,7 +194,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
     fileprivate func fileURL(for rawName: String) -> URL? {
         let name = rawName.hasPrefix("/") ? String(rawName.dropFirst()) : rawName
         guard !name.isEmpty, !name.contains("..") else { return nil }
-        return root.appendingPathComponent(name)
+        return ServedPath.confined(root.appendingPathComponent(name), to: root)   // symlinks too
     }
 
     fileprivate var rootURL: URL { root }
@@ -194,7 +206,14 @@ nonisolated final class TFTPServer: @unchecked Sendable {
     // Queue-confined like its owner — every callback hops onto serverQueue.
     fileprivate final class Session: @unchecked Sendable {
         private unowned let server: TFTPServer
+        /// The listener-side flow the request arrived on (server port 69).
         private let connection: NWConnection
+        /// The transfer's own socket on a fresh ephemeral port — RFC 1350's
+        /// server TID. Replying from port 69 for the whole transfer let anyone
+        /// forge ACKs blind (port and block numbers were both predictable) and
+        /// stream a file at a spoofed victim. Nil until the request is accepted.
+        private var transfer: NWConnection?
+        private var io: NWConnection { transfer ?? connection }
         private let peer: String
 
         private var isWrite = false
@@ -230,6 +249,11 @@ nonisolated final class TFTPServer: @unchecked Sendable {
         private var currentBlock: UInt16 = 0   // last block sent (read) / acked (write)
         private var lastPacket = Data()
         private var retries = 0
+        /// Set once the peer acknowledges a DATA block (or sends us data). Until
+        /// then the "peer" may be a spoofed source address: we answer once and
+        /// retransmit at most once, so this server is a poor DDoS reflector
+        /// (it was ~5 resends of up to 8 KB to anyone, audit 2026-10-02).
+        private var peerProven = false
         private var generation = 0
         private var finished = false
         private var sentFinal = false
@@ -237,6 +261,12 @@ nonisolated final class TFTPServer: @unchecked Sendable {
         /// carries the ephemeral UDP port, but keep it uniform with the SSH
         /// handlers.)
         private let token = UUID().uuidString
+
+        /// The device's address without the (per-transfer) UDP port.
+        var peerHost: String {
+            if case let .hostPort(host, _) = connection.endpoint { return "\(host)" }
+            return peer
+        }
 
         init(server: TFTPServer, connection: NWConnection, peerOverride: String? = nil) {
             self.server = server
@@ -263,10 +293,37 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             // or the bar would hang .active while another server keeps running.
             if var t = lastActive, !transferDone { t.state = .failed; server.onProgress(t) }
             connection.cancel()
+            transfer?.cancel()
+        }
+
+        /// Moves the session onto its own ephemeral UDP port, connected to the
+        /// device; every later reply and receive uses it (devices follow the
+        /// RFC and answer the new TID). The port-69 flow is released.
+        private func openTransferPort() {
+            // An explicit wildcard local endpoint is required: with none,
+            // Network.framework tries the listener's own port and the flow
+            // sits in .waiting(EADDRINUSE) — nothing is ever sent.
+            let params = NWParameters.udp
+            var anyHost: NWEndpoint.Host = .ipv4(.any)
+            if case let .hostPort(host, _) = connection.endpoint, case .ipv6 = host {
+                anyHost = .ipv6(.any)
+            }
+            params.requiredLocalEndpoint = .hostPort(host: anyHost, port: .any)
+            let next = NWConnection(to: connection.endpoint, using: params)
+            next.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .failed, .waiting: self?.finish("could not open a transfer port", failed: true)
+                default: break
+                }
+            }
+            next.start(queue: server.serverQueue)
+            transfer = next
+            connection.stateUpdateHandler = nil
+            connection.cancel()
         }
 
         private func receiveNext(first: Bool = false) {
-            connection.receiveMessage { [weak self] data, _, _, error in
+            io.receiveMessage { [weak self] data, _, _, error in
                 guard let self, !self.finished else { return }
                 if error != nil { self.finish(nil); return }
                 guard let data, data.count >= 2 else {
@@ -397,6 +454,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
 
             server.log(peer: peer, isWrite: isWrite, filename: filename,
                        detail: "started", failed: false)
+            openTransferPort()
 
             if !acked.isEmpty {
                 var oack = Data([0, 6])
@@ -433,6 +491,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             // Lost packets are resent by the retransmit timer instead.
             guard block == currentBlock else { receiveNext(); return }
             retries = 0
+            if block >= 1 { peerProven = true }
             if sentFinal {
                 reportDone(done: fileSize, isUpload: false)
                 finish("sent \(ByteFormat.string(Int64(fileSize)))")
@@ -508,6 +567,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             guard packet.count >= 4 else { receiveNext(); return }
             let block = UInt16(packet[packet.startIndex + 2]) << 8 | UInt16(packet[packet.startIndex + 3])
             let payload = packet.dropFirst(4)
+            peerProven = true
             retries = 0     // forward progress — reset the per-stall counter (the
                             // read path already does this in handleAck; without it
                             // a lossy upload accumulates retries and falsely aborts)
@@ -552,7 +612,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
         // MARK: Plumbing
 
         private func send(_ packet: Data) {
-            connection.send(content: packet, completion: .contentProcessed { _ in })
+            io.send(content: packet, completion: .contentProcessed { _ in })
         }
 
         private func scheduleRetransmit() {
@@ -561,7 +621,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             server.serverQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self, !self.finished, self.generation == expected else { return }
                 self.retries += 1
-                if self.retries > 5 {
+                if self.retries > (self.peerProven ? 5 : 1) {
                     self.finish("timed out", failed: true)
                 } else {
                     self.send(self.lastPacket)
@@ -600,6 +660,7 @@ nonisolated final class TFTPServer: @unchecked Sendable {
             // (e.g. a rejected request) touch no bar.
             if var t = lastActive, !transferDone { t.state = .failed; server.onProgress(t) }
             connection.cancel()
+            transfer?.cancel()
             server.sessionEnded(self)
         }
     }

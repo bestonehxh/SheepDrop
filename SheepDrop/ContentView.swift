@@ -1,32 +1,23 @@
 import AppKit
 import SwiftUI
 
-/// Design v2 shell (from the user's chosen design canvas): a fixed 240pt
-/// sidebar that owns the traffic-light row, and a main column that shows
-/// either a connection (dual pane + transfers drawer), the Transfers
-/// screen, or the Serve screen. No tab strip — connections live in the
-/// sidebar.
+/// App shell, LabDC-style: a 248pt sidebar (Client / Server) and the selected page.
+/// No bar across the top; the sidebar is always there. Connections shows the
+/// host library page, or — once a host is opened — that host's session view.
 struct ContentView: View {
     @ObservedObject private var model = AppModel.shared
 
     var body: some View {
         HStack(spacing: 0) {
-            // Same as SheepTerm: a full-height column flush with the window
-            // edge, painted with the behind-window `.sidebar` material. NOT an
-            // inset floating glass panel — its corner radius didn't match the
-            // window's, so the traffic lights poked past the panel's edge.
             SidebarView()
-                .frame(width: 240)
+                .frame(width: 248)
             Rectangle()
-                .fill(Theme.hairline)
-                .frame(width: 0.5)
+                .fill(Theme.line)
+                .frame(width: 1)
             mainColumn
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Theme.background.ignoresSafeArea())
         }
-        // See-through glass for the WHOLE window (user asked for a transparent
-        // glass background, 2026-09-17): one behind-window vibrancy layer, and
-        // every main-column view leaves its background clear so the desktop
-        // shows through. Cards/controls on top use SwiftUI glass.
-        .background { VisualEffectBackground(material: .sidebar).ignoresSafeArea() }
         .frame(minWidth: 1060, minHeight: 640)
         .sheet(isPresented: $model.showQuickConnect) {
             QuickConnectSheet()
@@ -46,27 +37,29 @@ struct ContentView: View {
             if let tab = model.selectedTab {
                 ConnectionView(tab: tab).id(tab.id)
             } else {
-                EmptyPaneView()
+                ConnectionsPage()
             }
         }
     }
 }
 
-struct EmptyPaneView: View {
+/// Client-mode landing: the host library lives in the sidebar; the main
+/// column either shows a session (ConnectionView) or this quiet hint.
+struct ConnectionsPage: View {
     @ObservedObject private var model = AppModel.shared
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "arrow.up.arrow.down.circle")
-                .font(.system(size: 40, weight: .light))
-                .foregroundStyle(Theme.faintText)
-            Text("SheepDrop")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Theme.text)
-            Text("Pick a connection in the sidebar, or press ⌘T.")
-                .font(.system(size: 12.5))
-                .foregroundStyle(Theme.dimText)
+        // One hint, no button: "Add Device…" lives at the foot of the sidebar
+        // (and File ▸ ⌘T) — a second copy here sat right beside it.
+        QuietPage(title: "Devices", scrolls: false) {
+            VStack(alignment: .leading, spacing: 10) {
+                // A fresh install has one EMPTY default group — count hosts.
+                Text(model.groups.allSatisfy(\.hosts.isEmpty) && model.recents.isEmpty
+                     ? "No devices yet — use Add Device… at the bottom left (⌘T)."
+                     : "Pick a device on the left to open a file session.")
+                    .font(Theme.name)
+                    .foregroundStyle(Theme.ink)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

@@ -53,13 +53,17 @@ nonisolated final class FTPWorker: @unchecked Sendable {
 
     func download(remotePath: String, to localURL: URL,
                   progress: @escaping @Sendable (Int64, Int64) -> Void) async throws {
-        try await serialized { try await $0.doDownload(remotePath, localURL, progress) }
+        try await serialized { $0.cancel.reset(); return try await $0.doDownload(remotePath, localURL, progress) }
     }
 
     func upload(localURL: URL, to remotePath: String,
                 progress: @escaping @Sendable (Int64, Int64) -> Void) async throws {
-        try await serialized { try await $0.doUpload(localURL, remotePath, progress) }
+        try await serialized { $0.cancel.reset(); return try await $0.doUpload(localURL, remotePath, progress) }
     }
+
+    /// Stops the transfer in flight at its next chunk (any thread).
+    let cancel = TransferCancel()
+    func cancelTransfer() { cancel.request() }
 
     /// Strict operation chain. The old `queue.async { Task { … } }` wrapper
     /// only serialized *task creation* — the async bodies ran concurrently on
@@ -98,8 +102,10 @@ nonisolated final class FTPWorker: @unchecked Sendable {
             // A server that accepts TCP but never greets must not hold
             // Connect for the full stall timeout.
             _ = try await readReply(timeout: Self.connectTimeout)   // 220 welcome
-            try await command("USER \(config.username)", expect: [220, 230, 331])
-            if let password = config.password {
+            let user = try await command("USER \(config.username)", expect: [220, 230, 331])
+            // 230 = logged in without a password (anonymous-style); sending
+            // PASS anyway gets a 503 on strict servers and failed the connect.
+            if !user.hasPrefix("230"), let password = config.password {
                 try await command("PASS \(password)", expect: [230, 202])
             }
             try await command("TYPE I", expect: [200])       // binary
@@ -165,8 +171,20 @@ nonisolated final class FTPWorker: @unchecked Sendable {
                 try handle.write(contentsOf: chunk)
                 done += Int64(chunk.count)
                 progress(done, total)
+                if self.cancel.isRequested {
+                    // Dropping the data link makes the server answer 426 (or
+                    // 226); read it so the control stream stays in step.
+                    dataConn.cancel()
+                    _ = try? await self.readReply(timeout: 5)
+                    throw TransferCancel.error
+                }
             }
             try await self.expectTransferComplete()
+            // Some servers RST the data link and still send 226: SIZE is the
+            // check that the file actually arrived whole.
+            if total > 0, done != total {
+                throw SFTPError(message: "\(remotePath) arrived incomplete: \(done) of \(total) bytes")
+            }
             return Data()
         }
     }
@@ -188,6 +206,11 @@ nonisolated final class FTPWorker: @unchecked Sendable {
                 try await self.send(dataConn, chunk)
                 done += Int64(chunk.count)
                 progress(done, total)
+                if self.cancel.isRequested {
+                    dataConn.cancel()
+                    _ = try? await self.readReply(timeout: 5)
+                    throw TransferCancel.error
+                }
             }
             dataConn.cancel()                            // EOF to the server
             try await self.expectTransferComplete()
@@ -414,6 +437,21 @@ nonisolated final class FTPWorker: @unchecked Sendable {
     /// "\r\n" as ONE Character that equals neither "\n" nor "\r", so a
     /// Character-level split would collapse the whole listing into one line
     /// (the recurring CRLF trap; see SheepText's CLAUDE.md).
+    /// The rest of `line` after `count` whitespace-separated fields, verbatim.
+    static func tail(of line: String, afterFields count: Int) -> String? {
+        var index = line.startIndex
+        for _ in 0..<count {
+            while index < line.endIndex, line[index] == " " { index = line.index(after: index) }
+            while index < line.endIndex, line[index] != " " { index = line.index(after: index) }
+        }
+        // Skip the column padding before the name (a name's own LEADING
+        // spaces can't be told apart from it; inner runs are kept).
+        guard index < line.endIndex else { return nil }
+        while index < line.endIndex, line[index] == " " { index = line.index(after: index) }
+        let name = String(line[index...])
+        return name.isEmpty ? nil : name
+    }
+
     static func parseList(_ text: String) -> [FileEntry] {
         var entries: [FileEntry] = []
         let lines = text.utf8.split(separator: 0x0A).map {
@@ -427,8 +465,9 @@ nonisolated final class FTPWorker: @unchecked Sendable {
             let isDir = first == "d"
             let size = Int64(fields[4]) ?? 0
             // name is everything after the 8th field (perms, links, owner,
-            // group, size, month, day, time/year, name…).
-            let name = fields[8...].joined(separator: " ")
+            // group, size, month, day, time/year, name…) taken from the RAW
+            // line — re-joining split fields collapsed runs of spaces in it.
+            let name = Self.tail(of: line, afterFields: 8) ?? fields[8...].joined(separator: " ")
             if name == "." || name == ".." { continue }
             if first == "l" {
                 // symlink: "name -> target"; keep just the name. Listed as a

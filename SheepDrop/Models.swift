@@ -73,6 +73,8 @@ struct TransferRecord: Identifiable, Sendable {
     var finished: Date
     var failed: Bool
     var bytes: Int64
+    /// Stopped by the user — shown as "Cancelled", not counted as a failure.
+    var cancelled = false
 }
 
 enum ConnectionStatus: Equatable, Sendable {

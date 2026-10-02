@@ -40,11 +40,6 @@ final class SFTPSession: ObservableObject {
         // this is cheap.
         didSet {
             AppModel.shared.transfersDidChange()
-            // Auto-open the drawer when a transfer STARTS so the live
-            // MB/percent bar is visible without hunting for it.
-            if transfer != nil, oldValue == nil {
-                AppModel.shared.drawerOpen = true
-            }
         }
     }
 
@@ -145,7 +140,7 @@ final class SFTPSession: ObservableObject {
 
     /// `-flag value` from the launch arguments; dev hooks only.
     private static func devArgument(_ flag: String) -> String? {
-        let arguments = CommandLine.arguments
+        let arguments = DevHooks.arguments
         guard let index = arguments.firstIndex(of: flag),
               arguments.indices.contains(index + 1) else { return nil }
         return arguments[index + 1]
@@ -228,6 +223,18 @@ final class SFTPSession: ObservableObject {
                 needsPassword = false
             }
         }
+    }
+
+    static func isCancel(_ error: Error) -> Bool {
+        (error as? SFTPError)?.message == TransferCancel.error.message
+    }
+
+    /// Stops the running upload/download at its next chunk. Downloads leave
+    /// nothing behind (the hidden .part file is removed); an upload may leave
+    /// a partial file on the device.
+    func cancelTransfer() {
+        worker.cancelTransfer()
+        ftp.cancelTransfer()
     }
 
     func disconnect() {
@@ -369,7 +376,7 @@ final class SFTPSession: ObservableObject {
                 AppModel.shared.recordTransfer(
                     name: localURL.lastPathComponent,
                     detail: "\(host.proto.label) · \(host.displayName) \(path)",
-                    isUpload: true, bytes: 0, failed: true)
+                    isUpload: true, bytes: 0, failed: true, cancelled: Self.isCancel(error))
                 report(error, prefix: "Upload failed: ")
             }
         }
@@ -418,7 +425,7 @@ final class SFTPSession: ObservableObject {
                 AppModel.shared.recordTransfer(
                     name: entryName,
                     detail: "\(host.proto.label) · \(host.displayName) → local",
-                    isUpload: false, bytes: 0, failed: true)
+                    isUpload: false, bytes: 0, failed: true, cancelled: Self.isCancel(error))
                 report(error, prefix: "Download failed: ")
             }
         }
@@ -438,6 +445,13 @@ final class SFTPSession: ObservableObject {
     private static func downloadAtomically(to localURL: URL,
                                            _ body: (URL) async throws -> Void) async throws {
         let fm = FileManager.default
+        // replaceItemAt happily replaces a DIRECTORY: a remote file named like
+        // a local folder (malicious server or a plain clash) wiped the folder
+        // and its contents for good. Refuse before touching anything.
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: localURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            throw SFTPError(message: "a folder named \(localURL.lastPathComponent) is already here — rename or move it first")
+        }
         let partURL = localURL.deletingLastPathComponent()
             .appendingPathComponent(".\(localURL.lastPathComponent).sheepdrop-part")
         do {
@@ -479,8 +493,11 @@ final class SFTPSession: ObservableObject {
 
     func scpPull(remotePath: String, into localDirectory: URL,
                  completion: @escaping @MainActor (String?) -> Void) {
-        let name = (remotePath as NSString).lastPathComponent
-        let localURL = localDirectory.appendingPathComponent(name.isEmpty ? "download" : name)
+        // The typed remote path decides the local name: "." or "x/.." must not
+        // make localURL the download folder itself or its parent.
+        let rawName = (remotePath as NSString).lastPathComponent
+        let name = Self.isSafeLocalName(rawName) ? rawName : "download"
+        let localURL = localDirectory.appendingPathComponent(name)
         transfer = TransferState(name: name, isUpload: false, done: 0, total: 0)
         Task {
             do {
@@ -509,7 +526,8 @@ final class SFTPSession: ObservableObject {
     }
 
     private func shortMessage(_ error: Error) -> String {
-        (error as? SFTPError)?.message ?? error.localizedDescription
+        if let link = error as? SSHLinkError { return link.message }
+        return (error as? SFTPError)?.message ?? error.localizedDescription
     }
 
     /// True when an error means the transport itself is gone — the server
@@ -524,6 +542,10 @@ final class SFTPSession: ObservableObject {
             return dead.contains(code)
         }
         if let posix = error as? POSIXError { return dead.contains(posix.code) }
+        // The socket layer under SheepSSH: any error from it mid-session (RST,
+        // EOF, poll failure) means the link is gone. These escaped the pump
+        // unwrapped, so a reset left the tab "Connected" on a stale listing.
+        if error is SSHLinkError { return true }
         if let message = (error as? SFTPError)?.message.lowercased() {
             // FTPWorker errors embed the server's reply verbatim ("FTP <code>
             // …"). A 4xx/5xx on a DATA transfer ("426 Connection closed",
@@ -562,6 +584,13 @@ final class SFTPSession: ObservableObject {
     /// failing with "socket is not connected" and no way back but closing the
     /// tab.
     private func report(_ error: Error, prefix: String = "") {
+        if Self.isCancel(error) {
+            // The user pressed Stop: say so plainly; the link is fine.
+            notice = prefix.hasPrefix("Upload")
+                ? "Upload cancelled — the device may keep a partial file."
+                : "Download cancelled."
+            return
+        }
         notice = "\(prefix)\(shortMessage(error))"
         guard isConnectionLost(error) else { return }
         worker.disconnect()
@@ -572,7 +601,7 @@ final class SFTPSession: ObservableObject {
     }
 }
 
-/// Modal password prompt shown by the dual-pane view.
+/// Modal password prompt shown by the dual-pane view. Quiet form.
 struct PasswordPromptSheet: View {
     @ObservedObject var session: SFTPSession
     @Environment(\.dismiss) private var dismiss
@@ -586,36 +615,48 @@ struct PasswordPromptSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             Text("Connect to \(session.host.displayName)")
-                .font(.system(size: 14, weight: .medium))
+                .font(Theme.pageTitle)
+                .tracking(-0.5)
+                .foregroundStyle(Theme.ink)
+                .lineLimit(1)
             Text("\(session.host.address):\(String(session.host.port)) · \(session.host.proto.label)")
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
-            TextField("Username", text: $username)
-                .textFieldStyle(.roundedBorder)
-            SecureField("Password", text: $password)
-                .textFieldStyle(.roundedBorder)
-            if let authError = session.authError {
-                Text(authError)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.err)
+                .foregroundStyle(Theme.muted)
+
+            VStack(alignment: .leading, spacing: 14) {
+                QuietFieldLabel(label: "USERNAME") {
+                    TextField("admin", text: $username)
+                        .textFieldStyle(.quiet)
+                }
+                QuietFieldLabel(label: "PASSWORD") {
+                    SecureField("••••••••", text: $password)
+                        .textFieldStyle(.quiet)
+                }
+                Toggle("Remember in Keychain", isOn: $remember)
+                    .toggleStyle(.quiet)
+                    .font(Theme.detail)
             }
-            Toggle("Remember in Keychain", isOn: $remember)
-                .font(.system(size: 12))
-            HStack(spacing: 10) {
+
+            if let authError = session.authError {
+                QuietNote(authError, attention: true)
+            }
+
+            HStack(spacing: 20) {
                 if session.isLoading {
                     ProgressView()
                         .controlSize(.small)
                     Text("Connecting…")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.muted)
                 }
                 Spacer()
                 Button("Cancel") {
                     dismiss()
                     session.cancelConnect()
                 }
+                .buttonStyle(.quietBordered)
                 .keyboardShortcut(.cancelAction)
                 .disabled(session.isLoading)
                 // No dismiss here: the sheet stays up through the attempt and
@@ -625,13 +666,16 @@ struct PasswordPromptSheet: View {
                     session.updateUsername(username.trimmingCharacters(in: .whitespaces))
                     session.connect(password: password, remember: remember)
                 }
+                .buttonStyle(.quietPrimary)
                 .keyboardShortcut(.defaultAction)
                 .disabled(session.isLoading || password.isEmpty
                     || username.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+            .padding(.top, 4)
         }
-        .padding(20)
-        .frame(width: 360)
+        .padding(28)
+        .frame(width: 380)
+        .background(Theme.background)
         .interactiveDismissDisabled(session.isLoading)
     }
 }

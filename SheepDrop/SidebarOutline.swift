@@ -136,15 +136,30 @@ struct SidebarOutline: NSViewRepresentable {
 
         private func makeSignature() -> String {
             let g = model.groups.map { grp in
-                "\(grp.id)|\(grp.name)|" + grp.hosts.map { "\($0.id):\($0.displayName):\($0.proto.rawValue)" }.joined(separator: ",")
+                "\(grp.id)|\(grp.name)|" + grp.hosts.map { "\($0.id):\($0.displayName):\($0.proto.rawValue):\($0.username)@\($0.address):\($0.port)" }.joined(separator: ",")
             }.joined(separator: ";")
-            let r = recentsToShow().map { "\($0.id)" }.joined(separator: ",")
+            // username/address/port too: a username fixed in the password sheet
+            // left node.host stale, so the next click missed the open tab and
+            // opened a duplicate with the old name (audit 2026-10-02).
+            let r = recentsToShow().map { "\($0.id):\($0.username)@\($0.address):\($0.port)" }.joined(separator: ",")
             return g + "##" + r
         }
 
+        /// Unsaved hosts: every one with an open session first (so a session
+        /// can always be found and closed — there is no separate "Open" list;
+        /// the row itself shows the state), then up to 3 other recents.
         private func recentsToShow() -> [HostEntry] {
             let saved = Set(model.groups.flatMap(\.hosts).map(key))
-            return Array(recents.lazy.filter { !saved.contains(self.key($0)) }.prefix(3))
+            var seen = saved
+            var result: [HostEntry] = []
+            for tab in model.tabs where !seen.contains(key(tab.host)) {
+                seen.insert(key(tab.host)); result.append(tab.host)
+            }
+            var others = 0
+            for host in recents where others < 3 && !seen.contains(key(host)) {
+                seen.insert(key(host)); result.append(host); others += 1
+            }
+            return result
         }
 
         private func key(_ h: HostEntry) -> String {
@@ -167,8 +182,8 @@ struct SidebarOutline: NSViewRepresentable {
 
         func outlineView(_ ov: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
             switch (item as? SidebarItem)?.kind {
-            case .section: return 26
-            case .group: return 26
+            case .section: return 34
+            case .group: return 34
             default: return 42
             }
         }
@@ -189,7 +204,7 @@ struct SidebarOutline: NSViewRepresentable {
             case .section:
                 content = AnyView(OutlineSectionLabel(text: node.title))
             case .group:
-                content = AnyView(OutlineGroupLabel(name: node.title, count: node.group?.hosts.count ?? 0))
+                content = AnyView(OutlineGroupLabel(name: node.title))
             case .host:
                 content = AnyView(OutlineHostContent(host: node.host!, isRecent: node.isRecent))
             }
@@ -238,6 +253,18 @@ struct SidebarOutline: NSViewRepresentable {
             }
         }
 
+        /// One vocabulary everywhere: **Disconnect** drops the link and keeps
+        /// the session (Connect brings it back); **Close** ends the session.
+        /// The host menu's "Disconnect" used to close the tab outright.
+        private func addSessionItems(for host: HostEntry, to menu: NSMenu) {
+            guard let tab = openTab(for: host) else { return }
+            if case .connected = tab.status {
+                menu.addItem(MenuAction(title: "Disconnect") { tab.sftp?.disconnect() })
+            }
+            menu.addItem(MenuAction(title: "Close") { [self] in model.closeTab(tab) })
+            menu.addItem(.separator())
+        }
+
         /// Deleting a group deletes every host in it, with no undo — it used
         /// to happen on a single menu click.
         private func confirmDelete(_ group: HostGroup) {
@@ -276,6 +303,7 @@ struct SidebarOutline: NSViewRepresentable {
                         save.submenu = sub
                         menu.addItem(save)
                     }
+                    addSessionItems(for: host, to: menu)
                     menu.addItem(MenuAction(title: "Remove from Recents") { [self] in model.removeRecent(host) })
                 }
             case .host:
@@ -293,14 +321,12 @@ struct SidebarOutline: NSViewRepresentable {
                         move.submenu = sub
                         menu.addItem(move)
                     }
-                    if let tab = openTab(for: host) {
-                        menu.addItem(MenuAction(title: "Disconnect") { [self] in model.closeTab(tab) })
-                    }
-                    menu.addItem(MenuAction(title: "Delete Host") { [self] in model.deleteHost(host) })
+                    addSessionItems(for: host, to: menu)
+                    menu.addItem(MenuAction(title: "Delete Device") { [self] in model.deleteHost(host) })
                 }
             case .group:
                 if let group = node.group {
-                    menu.addItem(MenuAction(title: "New Host in “\(group.name)”") { [self] in
+                    menu.addItem(MenuAction(title: "Add Device to “\(group.name)”…") { [self] in
                         model.pendingGroupID = group.id; model.showQuickConnect = true
                     })
                     menu.addItem(.separator())
@@ -410,14 +436,15 @@ final class OutlineView: NSOutlineView {
     }
 }
 
-/// Accent pill selection, drawn here so it isn't the washed-out unfocused grey
-/// (the sidebar hands focus back to content on every click).
+/// Quiet table selection, drawn here so it isn't the washed-out unfocused grey
+/// (the sidebar hands focus back to content on every click): a rounded fill
+/// one step darker than the sidebar, inset 8 pt from each edge.
 final class RowView: NSTableRowView {
     override func drawSelection(in dirtyRect: NSRect) {
         guard selectionHighlightStyle != .none else { return }
-        let inset = bounds.insetBy(dx: 8, dy: 2)
-        NSColor(Theme.selectedRow).setFill()
-        NSBezierPath(roundedRect: inset, xRadius: 7, yRadius: 7).fill()
+        let inset = bounds.insetBy(dx: 8, dy: 0)
+        NSColor(Theme.sidebarSelection).setFill()
+        NSBezierPath(roundedRect: inset, xRadius: 8, yRadius: 8).fill()
     }
 }
 
@@ -454,89 +481,106 @@ private final class MenuAction: NSMenuItem {
 
 // MARK: - Cell content (gesture-less; the outline drives interaction)
 
+/// "RECENT": uppercase 11 pt semibold, tracked, faint.
 private struct OutlineSectionLabel: View {
     let text: String
     var body: some View {
-        Text(text.uppercased())
-            .font(.system(size: 11, weight: .semibold))
-            .kerning(0.3)
-            .foregroundStyle(Theme.faintText)
-            .padding(.horizontal, 10)
+        GroupLabel(text: text)
+            .padding(.horizontal, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-            .padding(.bottom, 4)
+            .padding(.bottom, 6)
     }
 }
 
+/// A host group's label — the same quiet uppercase label as a section.
 private struct OutlineGroupLabel: View {
     let name: String
-    let count: Int
     var body: some View {
-        HStack(spacing: 6) {
-            Text(name.uppercased())
-                .font(.system(size: 11, weight: .semibold))
-                .kerning(0.3)
-                .foregroundStyle(Theme.faintText)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-        .padding(.bottom, 4)
+        GroupLabel(text: name)
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            .padding(.bottom, 6)
     }
 }
 
+/// A host row (42 pt): protocol dot, 14 pt name, `user@address` under it.
 private struct OutlineHostContent: View {
     let host: HostEntry
     let isRecent: Bool
     @ObservedObject private var model = AppModel.shared
 
-    /// Green only for a tab that is actually connected to THIS host — a failed
-    /// attempt used to show green (`!= .disconnected`), and address+protocol
-    /// alone lit up every saved entry for the same device.
+    /// The open session for THIS host (all four identity fields — address
+    /// and protocol alone lit up every saved entry for the same device).
+    private var tab: SessionTab? {
+        model.tabs.first {
+            $0.host.address == host.address && $0.host.port == host.port
+                && $0.host.username == host.username && $0.host.proto == host.proto
+        }
+    }
+
     private var isConnected: Bool {
-        model.tabs.contains {
-            guard $0.host.address == host.address, $0.host.port == host.port,
-                  $0.host.username == host.username, $0.host.proto == host.proto else { return false }
-            if case .connected = $0.status { return true }
-            return false
+        if let tab, case .connected = tab.status { return true }
+        return false
+    }
+
+    private var isFailed: Bool {
+        if let tab, case .failed = tab.status { return true }
+        return false
+    }
+
+    private var isShown: Bool {
+        tab != nil && tab?.id == model.selectedTabID && model.mainPane == .connection
+    }
+
+    /// With a session open the second line is its state, in words.
+    private var stateLine: String? {
+        guard let tab else { return nil }
+        switch tab.status {
+        case .connected: return "Connected"
+        case .connecting: return "Connecting…"
+        case .disconnected: return "Not connected"
+        case .failed: return "Failed"
         }
     }
 
     var body: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 10) {
+            // The protocol's identity dot; green while a tab to this host is
+            // actually connected.
             Circle()
-                .fill(isConnected ? Theme.ok : Theme.protoColor(host.proto))
-                .frame(width: 7, height: 7)
-            VStack(alignment: .leading, spacing: 0) {
+                .fill(isConnected ? Theme.ok : isFailed ? Theme.attention : Theme.protoColor(host.proto))
+                .frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 1) {
                 Text(host.displayName)
-                    .font(.system(size: 13))
-                    .foregroundStyle(Theme.text)
+                    .font(.system(size: 14, weight: isShown ? .semibold : .medium))
+                    .foregroundStyle(Theme.ink)
                     .lineLimit(1)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.faintText)
+                if let line = stateLine ?? subtitle {
+                    Text(line)
+                        .font(Theme.small)
+                        .foregroundStyle(isConnected ? Theme.ok : isFailed ? Theme.attention : Theme.faint)
                         .lineLimit(1)
                 }
             }
             Spacer(minLength: 0)
-            Text(host.proto.label)
-                .font(.system(size: 9.5, weight: .bold))
-                .kerning(0.3)
-                .foregroundStyle(Theme.protoColor(host.proto))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(RoundedRectangle(cornerRadius: 4).fill(Theme.protoColor(host.proto).opacity(0.12)))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(host.displayName), \(host.proto.label)\(stateLine.map { ", " + $0 } ?? "")")
     }
 
+    /// `user@address[:port]` (the port only when non-default). Without a
+    /// username (TFTP) it is the address — suppressed when it would just
+    /// repeat the name.
     private var subtitle: String? {
         let hasName = !host.name.isEmpty && host.name != host.address
         let portPart = host.port == host.proto.defaultPort ? "" : ":\(host.port)"
-        if hasName { return "\(host.address)\(portPart)" }
-        if host.proto == .tftp { return portPart.isEmpty ? nil : "port \(host.port)" }
-        guard !host.username.isEmpty else { return portPart.isEmpty ? nil : "port \(host.port)" }
-        return "\(host.username)@\(host.address)\(portPart)"
+        let address = "\(host.address)\(portPart)"
+        if host.proto == .tftp || host.username.isEmpty {
+            if hasName { return address }
+            return portPart.isEmpty ? nil : "port \(host.port)"
+        }
+        return "\(host.username)@\(address)"
     }
 }

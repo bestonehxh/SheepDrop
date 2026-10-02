@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// The Transfers screen (design v2): every live transfer plus the session
-/// history, with a today total in the footer.
+/// The Activity screen: every live transfer plus the session history, with a
+/// today summary in the header.
 struct TransfersView: View {
     @ObservedObject private var model = AppModel.shared
 
@@ -10,60 +10,35 @@ struct TransfersView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            PaneStrip {
-                Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.dimText)
-                Text("Transfers")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Theme.text2)
-                Spacer(minLength: 0)
-                if !model.transferHistory.isEmpty {
-                    Button("Clear history") { model.transferHistory.removeAll() }
-                        .buttonStyle(.link)
-                        .font(.system(size: 11.5))
-                }
-            }
-
-            if liveTabs.isEmpty && model.transferHistory.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "arrow.up.arrow.down.circle")
-                        .font(.system(size: 32, weight: .light))
-                        .foregroundStyle(Theme.faintText)
-                    Text("No transfers yet")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Theme.text2)
-                    Text("Uploads and downloads from every connection land here.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.dimText)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
+        QuietPage(title: "Activity", subtitle: todaySummary) {
+            VStack(alignment: .leading, spacing: 0) {
+                if liveTabs.isEmpty && model.transferHistory.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No transfers yet")
+                            .font(Theme.subtitle)
+                            .foregroundStyle(Theme.ink)
+                        Text("Uploads and downloads from every connection land here.")
+                            .font(Theme.body)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    .padding(.top, 16)
+                } else {
+                    if !liveTabs.isEmpty {
+                        GroupLabel(text: "In progress")
+                            .padding(.bottom, 4)
                         ForEach(liveTabs) { tab in
                             LiveTransferRow(tab: tab)
                         }
+                    }
+                    if !model.transferHistory.isEmpty {
+                        GroupLabel(text: "History")
+                            .padding(.top, liveTabs.isEmpty ? 0 : 24)
+                            .padding(.bottom, 4)
                         ForEach(model.transferHistory) { record in
                             HistoryTransferRow(record: record)
                         }
                     }
-                    .padding(10)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-
-            HStack {
-                Text(todaySummary)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.dimText)
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 26)
-            .overlay(alignment: .top) {
-                Rectangle().fill(Theme.hairlineSoft).frame(height: 0.5)
             }
         }
     }
@@ -74,6 +49,6 @@ struct TransfersView: View {
         guard !today.isEmpty else { return "Nothing transferred today" }
         let failed = today.filter(\.failed).count
         let suffix = failed == 0 ? "" : " · \(failed) failed"
-        return "\(today.count) transfers today\(suffix)"
+        return "\(today.count) transfer\(today.count == 1 ? "" : "s") today\(suffix)"
     }
 }
