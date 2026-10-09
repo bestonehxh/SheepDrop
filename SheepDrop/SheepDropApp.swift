@@ -11,6 +11,10 @@ struct SheepDropApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1320, height: 840)
         .commands {
+            // SheepDrop menu, under About (in-app updater, SheepDropUpdate.swift).
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { AppUpdater.shared.checkNow() }
+            }
             // Single-window app: AppModel.shared is process-global state, a second
             // window would mirror the first. Same decision as SheepTerm.
             CommandGroup(replacing: .newItem) {
@@ -53,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             default: break
             }
         }
+        // In-app updater: checks 5 s after launch, then every 24 h (always on).
+        AppUpdater.start()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
