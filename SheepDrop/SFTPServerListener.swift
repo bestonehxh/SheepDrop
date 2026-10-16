@@ -458,6 +458,15 @@ nonisolated final class SFTPServerListener: @unchecked Sendable {
                     if id == scpChannel { scpIO?.feed(bytes) }
                 case .eof(let id):
                     if id == scpChannel { scpIO?.markEOF() }
+                    // The client is done sending requests (OpenSSH `sftp`
+                    // closes its side on exit / `quit`). Like sftp-server
+                    // exiting on stdin EOF: report status 0, then EOF + CLOSE
+                    // once the last replies are out. Ignoring it left the
+                    // CLI waiting for our CLOSE forever (2026-10-16).
+                    if id == sftpChannel {
+                        connection.sendExitStatus(channel: id, code: 0)
+                        do { try connection.finish(id) } catch { dead = true }
+                    }
                 case .closed(let id):
                     if id == sftpChannel {
                         sftpHandler?.closeAll()

@@ -6,7 +6,9 @@
 // What it answers itself: SERVICE_REQUEST, USERAUTH (password only; the
 // authenticator closure decides; a "none" probe gets a failure that names
 // password, as OpenSSH's client relies on), session CHANNEL_OPEN,
-// WINDOW_ADJUST, CHANNEL_CLOSE, EOF, and CHANNEL_REQUEST replies. What it
+// WINDOW_ADJUST, CHANNEL_CLOSE, EOF, and CHANNEL_REQUEST replies. Ending a
+// channel from our side is the owner's call: `finish` (EOF + CLOSE after
+// the queue drains) or `close`. What it
 // hands up as events: the subsystem/exec request the owner serves, channel
 // data, EOF and close.
 import Foundation
@@ -72,6 +74,8 @@ public final class SSHServerConnection {
         var pendingCount: Int { outgoing.count - outgoingStart }
         var eofPending = false
         var eofSent = false
+        /// `finish` was called: CLOSE follows our EOF once the queue drains.
+        var closeAfterEOF = false
         var eofReceived = false
         var closeSent = false
         var closeReceived = false
@@ -291,6 +295,19 @@ public final class SSHServerConnection {
         try flush(channel)
     }
 
+    /// Ends the channel from our side the way a finished subsystem does:
+    /// EOF, then CLOSE — both only after every queued byte has gone out
+    /// (`close` alone would drop output the client's window still holds
+    /// back). The SFTP subsystem calls this when the client sends EOF:
+    /// OpenSSH's `sftp` closes its write side on exit and then waits for
+    /// the server's CLOSE, so ignoring the EOF left it hanging forever.
+    public func finish(_ id: UInt32) throws {
+        guard let channel = channels[id], !channel.closeSent else { return }
+        channel.eofPending = true
+        channel.closeAfterEOF = true
+        try flush(channel)
+    }
+
     public func close(_ id: UInt32) throws {
         guard let channel = channels[id] else { return }
         guard !channel.closeSent else { return }
@@ -328,6 +345,11 @@ public final class SSHServerConnection {
             w.writeByte(96)
             w.writeUInt32(channel.remote)
             try send(w.bytes)
+        }
+        if channel.closeAfterEOF, channel.eofSent, !channel.closeSent {
+            channel.closeSent = true
+            try sendClose(channel)
+            finishIfClosed(channel)
         }
     }
 
